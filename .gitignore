@@ -1,0 +1,5 @@
+# local test registry / scratch
+*.lock
+registry.json
+whiteboard/
+.DS_Store

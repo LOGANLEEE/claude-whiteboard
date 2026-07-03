@@ -1,0 +1,14 @@
+{
+  "name": "claude-whiteboard",
+  "description": "Coordination plugins for parallel Claude Code sessions.",
+  "owner": { "name": "Logan Lee" },
+  "plugins": [
+    {
+      "name": "claude-whiteboard",
+      "source": "./",
+      "description": "Shared whiteboard for parallel Claude Code sessions — post the ticket you're on, get warned before doing double-work. Zero steady-state token cost.",
+      "version": "0.1.0",
+      "author": { "name": "Logan Lee" }
+    }
+  ]
+}

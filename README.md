@@ -18,14 +18,29 @@ starting work another session already owns**.
 | Hook | What it does |
 |------|--------------|
 | `SessionStart` | Registers this session and injects the list of *other* active sessions into context. |
-| `UserPromptSubmit` | Sniffs a ticket id (e.g. `ETHEN-447`) from your prompt, records it as this session's current ticket, and — **only if another live session already holds that ticket** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
-| `SessionEnd` | Removes this session and prunes stale (crashed) entries past the TTL. |
+| `UserPromptSubmit` | Sniffs a ticket id (e.g. `ETHEN-447`) — and any claimed **label** (see below) — from your prompt, records it as this session's current work, and — **only if another live session already holds that same ticket or label** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
+| `SessionEnd` | Removes this session (ticket and label) and prunes stale (crashed) entries past the TTL. |
 
 ```
 session A  ──"work on ETHEN-447"──▶  whiteboard: A = ETHEN-447
 session B  ──"work on ETHEN-447"──▶  ⚠ warns B: ETHEN-447 already owned by A → stop & confirm
 session A  ──"now ETHEN-880"─────▶  whiteboard: A = ETHEN-880   (updated in real time)
 ```
+
+### Ticketless work: claim a label
+
+No ticket id? Claim a free-text **label** so other sessions still get warned:
+
+```
+/claude-whiteboard:claim auth refactor   → whiteboard: this session = "auth refactor"
+                                            another session that claims "auth refactor" is warned
+/claude-whiteboard:release                → drop the label (also cleared at session end)
+```
+
+Labels match **exact, case-insensitive** — same reliability contract as ticket
+ids, so a warning always means a real overlap. There is no fuzzy free-text
+matching (that would fire false conflicts and erode trust in the warning). Ticket
+detection is unchanged; a prompt can carry both a ticket and a claimed label.
 
 ### Token cost
 
@@ -60,14 +75,17 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Commands
 
-- `/claude-whiteboard:status` — print the current board (active sessions, tickets, branches, last-seen age).
+- `/claude-whiteboard:status` — print the current board (active sessions, tickets, labels, branches, last-seen age).
+- `/claude-whiteboard:claim <label>` — claim a free-text label for ticketless work so other sessions are warned off it.
+- `/claude-whiteboard:release` — drop this session's claimed label.
 
 ## Notes & limits
 
 - **Pull, not push.** A session learns another moved on at *its own* next prompt or
   restart — at most one turn of lag. Fine for avoiding double-work.
-- **Ticket-based.** Detection keys on a ticket id in your prompt. Free-text work
-  with no ticket id isn't tracked (mention the ticket once and it's captured).
+- **Ticket or label.** Automatic detection keys on a ticket id in your prompt.
+  Ticketless work is tracked only when you `/claude-whiteboard:claim` a label —
+  there is deliberately no fuzzy free-text sniffing.
 - **Concurrency-safe.** Writes are serialized with a portable `mkdir` lock (no
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 

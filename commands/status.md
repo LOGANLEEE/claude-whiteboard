@@ -9,4 +9,4 @@ Run the whiteboard status script and show the user the current board of active s
 "${CLAUDE_PLUGIN_ROOT}"/scripts/status.sh
 ```
 
-Present the output as a short table (session, ticket, branch, age). If the board is empty, say no other sessions are active.
+Present the output as a short table (session, ticket, label, branch, age). If the board is empty, say no other sessions are active.

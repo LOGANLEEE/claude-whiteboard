@@ -41,7 +41,8 @@ others="$(wb_read_fresh | jq -r --arg self "$sid" '
   | map(select(.key != $self))
   | map("- " + (.key[0:8])
         + (if .value.ticket then "  ticket: " + .value.ticket else "  ticket: (none yet)" end)
-        + (if .value.branch  and .value.branch != "" then "  branch: " + .value.branch else "" end))
+        + (if .value.label  and .value.label != "" then "  label: " + .value.label else "" end)
+        + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end))
   | .[]' 2>/dev/null)"
 
 if [ -n "$others" ]; then

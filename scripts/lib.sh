@@ -75,3 +75,18 @@ wb_read_fresh() {
 
 # Short session id for display.
 wb_short() { printf '%s' "${1:0:8}"; }
+
+# Derive a ticket id from worktree dir / branch names passed as args.
+# "ethenapayf-1003-history-window" -> ETHENAPAYF-1003. Prints nothing if no match.
+wb_ticket_from_names() {
+  local name m
+  for name in "$@"; do
+    [ -n "$name" ] || continue
+    m="$(printf '%s' "$name" | grep -oiE '(ethenapayf|ethen)-?[0-9]+' | head -n1 || true)"
+    if [ -n "$m" ]; then
+      printf '%s' "$m" | tr '[:lower:]' '[:upper:]' | sed -E 's/^(ETHENAPAYF|ETHEN)-?/\1-/'
+      return 0
+    fi
+  done
+  return 1
+}

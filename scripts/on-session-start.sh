@@ -28,12 +28,20 @@ if [ -n "$cwd" ] && command -v git >/dev/null 2>&1; then
   branch="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
 fi
 
-# Register / refresh self. Preserve an existing ticket if we've seen this sid.
+# Auto-detect ticket from worktree dir / branch name (e.g. ethenapayf-1003-*).
+dir=""
+[ -n "$cwd" ] && dir="$(basename "$cwd")"
+ticket="$(wb_ticket_from_names "$dir" "$branch" || true)"
+
+# Register / refresh self. Detected ticket wins; else preserve existing.
 wb_update \
   '.sessions[$sid] = ((.sessions[$sid] // {})
-     + {cwd:$cwd, branch:$branch, started:(.sessions[$sid].started // ($now|tonumber)),
-        updated:($now|tonumber), ticket:(.sessions[$sid].ticket // null)})' \
-  --arg sid "$sid" --arg cwd "$cwd" --arg branch "$branch" --arg now "$now"
+     + {cwd:$cwd, dir:$dir, branch:$branch,
+        started:(.sessions[$sid].started // ($now|tonumber)),
+        updated:($now|tonumber),
+        ticket:(if $ticket != "" then $ticket else (.sessions[$sid].ticket // null) end)})' \
+  --arg sid "$sid" --arg cwd "$cwd" --arg dir "$dir" --arg branch "$branch" \
+  --arg ticket "$ticket" --arg now "$now"
 
 # Build the "others" view (fresh only, excluding self).
 others="$(wb_read_fresh | jq -r --arg self "$sid" '
@@ -42,6 +50,7 @@ others="$(wb_read_fresh | jq -r --arg self "$sid" '
   | map("- " + (.key[0:8])
         + (if .value.ticket then "  ticket: " + .value.ticket else "  ticket: (none yet)" end)
         + (if .value.label  and .value.label != "" then "  label: " + .value.label else "" end)
+        + (if .value.dir    and .value.dir    != "" then "  dir: " + .value.dir else "" end)
         + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end))
   | .[]' 2>/dev/null)"
 

@@ -29,6 +29,19 @@ now="$(wb_now)"
 # First ticket-looking token in the prompt.
 ticket="$(printf '%s' "$prompt" | grep -oE "$WB_TICKET_RE" | head -n1 || true)"
 
+# Fallback: derive ticket from worktree dir / branch name (prompt may never
+# mention it, e.g. session opened directly in an ethenapayf-1003-* worktree).
+if [ -z "$ticket" ]; then
+  cwd="$(printf '%s' "$input" | jq -r '.cwd // ""')"
+  branch=""
+  if [ -n "$cwd" ] && command -v git >/dev/null 2>&1; then
+    branch="$(git -C "$cwd" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  fi
+  dir=""
+  [ -n "$cwd" ] && dir="$(basename "$cwd")"
+  ticket="$(wb_ticket_from_names "$dir" "$branch" || true)"
+fi
+
 # Claim / release markers.
 release=""
 label=""

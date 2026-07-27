@@ -19,6 +19,7 @@ rows="$(wb_read_fresh | jq -r --arg now "$(wb_now)" '
   | map(
       (.key[0:8])
       + "\t" + (.value.ticket // "(none)")
+      + "\t" + (if .value.ticket then (.value.ticket_src // "prompt") else "-" end)
       + "\t" + ((.value.label // "") | if . == "" then "-" else . end)
       + "\t" + ((.value.branch // "") | if . == "" then "-" else . end)
       + "\t" + (((($now|tonumber) - .value.updated) / 60) | floor | tostring) + "m ago"
@@ -30,5 +31,5 @@ if [ -z "$rows" ]; then
   exit 0
 fi
 
-printf 'SESSION\tTICKET\tLABEL\tBRANCH\tLAST SEEN\n'
+printf 'SESSION\tTICKET\tSRC\tLABEL\tBRANCH\tLAST SEEN\n'
 printf '%s\n' "$rows"

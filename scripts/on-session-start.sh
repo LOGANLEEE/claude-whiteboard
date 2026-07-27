@@ -33,13 +33,16 @@ dir=""
 [ -n "$cwd" ] && dir="$(basename "$cwd")"
 ticket="$(wb_ticket_from_names "$dir" "$branch" || true)"
 
-# Register / refresh self. Detected ticket wins; else preserve existing.
+# Register / refresh self. A worktree-derived ticket is STRONG evidence: it wins
+# over anything already recorded (including a value sniffed from a prompt) and
+# is tagged as such, so only it can raise a conflict in another session.
 wb_update \
   '.sessions[$sid] = ((.sessions[$sid] // {})
      + {cwd:$cwd, dir:$dir, branch:$branch,
         started:(.sessions[$sid].started // ($now|tonumber)),
         updated:($now|tonumber),
-        ticket:(if $ticket != "" then $ticket else (.sessions[$sid].ticket // null) end)})' \
+        ticket:(if $ticket != "" then $ticket else (.sessions[$sid].ticket // null) end),
+        ticket_src:(if $ticket != "" then "worktree" else (.sessions[$sid].ticket_src // null) end)})' \
   --arg sid "$sid" --arg cwd "$cwd" --arg dir "$dir" --arg branch "$branch" \
   --arg ticket "$ticket" --arg now "$now"
 
@@ -48,7 +51,11 @@ others="$(wb_read_fresh | jq -r --arg self "$sid" '
   .sessions | to_entries
   | map(select(.key != $self))
   | map("- " + (.key[0:8])
-        + (if .value.ticket then "  ticket: " + .value.ticket else "  ticket: (none yet)" end)
+        + (if .value.ticket
+           then "  ticket: " + .value.ticket
+                + (if (.value.ticket_src // "") == "worktree" then ""
+                   else " (mentioned, not confirmed by a worktree)" end)
+           else "  ticket: (none yet)" end)
         + (if .value.label  and .value.label != "" then "  label: " + .value.label else "" end)
         + (if .value.dir    and .value.dir    != "" then "  dir: " + .value.dir else "" end)
         + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end))

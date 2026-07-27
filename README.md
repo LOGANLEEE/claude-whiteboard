@@ -18,7 +18,7 @@ starting work another session already owns**.
 | Hook | What it does |
 |------|--------------|
 | `SessionStart` | Registers this session and injects the list of *other* active sessions into context. |
-| `UserPromptSubmit` | Sniffs a ticket id (e.g. `ETHEN-447`) — and any claimed **label** (see below) — from your prompt, records it as this session's current work, and — **only if another live session already holds that same ticket or label** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
+| `UserPromptSubmit` | Works out this session's current ticket (see [Ticket evidence](#ticket-evidence-mention--work)) plus any claimed **label**, records it, and — **only if another live session demonstrably owns that same ticket or label** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
 | `SessionEnd` | Removes this session (ticket and label) and prunes stale (crashed) entries past the TTL. |
 
 ```
@@ -26,6 +26,52 @@ session A  ──"work on ETHEN-447"──▶  whiteboard: A = ETHEN-447
 session B  ──"work on ETHEN-447"──▶  ⚠ warns B: ETHEN-447 already owned by A → stop & confirm
 session A  ──"now ETHEN-880"─────▶  whiteboard: A = ETHEN-880   (updated in real time)
 ```
+
+### Ticket evidence: mention ≠ work
+
+Where a ticket id comes from decides how much it is trusted:
+
+| Evidence | `ticket_src` | Strength | Behaviour |
+|----------|--------------|----------|-----------|
+| Worktree dir or branch name (`ethenapayf-1013-kyc-camera`, `jira-12-login-fix`, `feature/ETHEN-447`) | `worktree` | **strong** | Always wins. Overwrites a value previously sniffed from a prompt. |
+| Ticket id inside your prompt (`ETHEN-447`) | `prompt` | weak | Used only when the session has no worktree evidence **and** no ticket recorded yet. Never overwrites an existing ticket. |
+
+Dir/branch detection uses the same `CC_WHITEBOARD_TICKET_RE` as prompt sniffing,
+so it works for any tracker — not one hard-coded project prefix.
+
+How loud a warning gets depends on the **holder's** evidence:
+
+| Holder's `ticket_src` | You get |
+|-----------------------|---------|
+| `worktree` — they are sitting in that worktree | `⚠ CONFLICT` + an instruction to stop and check with you |
+| `prompt` (or a pre-0.2.2 entry with none) — they only mentioned it | a one-line note, no stop directive |
+
+```
+[claude-whiteboard] ⚠ CONFLICT: ticket "ETHENAPAYF-1013" is already being worked
+on by session 4a9f21c8 (dir: ethenapayf-1013-kyc-camera, branch: feat/kyc-camera)
+This is likely DOUBLE WORK. STOP before editing code: …
+
+[claude-whiteboard] note: session 3689a1c2 (dir: worktrees) also mentioned ETHENAPAYF-1013.
+```
+
+The message names the holder's **directory** and branch so you can verify
+ownership at a glance. Each distinct overlap is announced **once** — the same
+ticket held by the same session will not warn again, so a real conflict can't
+turn into an every-prompt drumbeat. A different holder warns again.
+
+#### `@wb-ignore`
+
+Put `@wb-ignore` in a prompt (as a whitespace-delimited token, anywhere) and the
+hook is a complete no-op for it — no ticket sniffing, no claim markers, no
+registry write, no conflict check:
+
+```
+@wb-ignore
+Board dump from the other terminal — ETHENAPAYF-1013 is owned by session 3689…
+```
+
+Use it for pasted coordination dumps, cross-checks, and status reports that talk
+*about* tickets you are not working on.
 
 ### Ticketless work: claim a label
 
@@ -70,7 +116,7 @@ claude --plugin-dir ./claude-whiteboard
 | Var | Default | Purpose |
 |-----|---------|---------|
 | `CC_WHITEBOARD_REGISTRY` | `$CLAUDE_PLUGIN_DATA/whiteboard/registry.json` (falls back to `~/.claude/...`) | Where the shared registry lives. Point several sessions at the same path (default already does). Set to a repo-local path if you want per-repo boards. |
-| `CC_WHITEBOARD_TICKET_RE` | `[A-Z][A-Z0-9]+-[0-9]+` | Regex used to detect a ticket id in a prompt. Matches `ETHEN-447`, `JIRA-12`, etc. |
+| `CC_WHITEBOARD_TICKET_RE` | `[A-Z][A-Z0-9]+-[0-9]+` | Regex used to detect a ticket id, both in a prompt and (case-insensitively) in the worktree dir / branch name. Matches `ETHEN-447`, `JIRA-12`, etc. Tighten it if your naming produces false hits — e.g. a directory called `portfolio-2024` reads as ticket `PORTFOLIO-2024`. |
 | `CC_WHITEBOARD_TTL` | `14400` (4h) | Entries older than this are treated as stale and pruned (crash safety). |
 
 ## Commands
@@ -83,11 +129,64 @@ claude --plugin-dir ./claude-whiteboard
 
 - **Pull, not push.** A session learns another moved on at *its own* next prompt or
   restart — at most one turn of lag. Fine for avoiding double-work.
-- **Ticket or label.** Automatic detection keys on a ticket id in your prompt.
-  Ticketless work is tracked only when you `/claude-whiteboard:claim` a label —
-  there is deliberately no fuzzy free-text sniffing.
+- **Ticket or label.** Automatic detection prefers the worktree/branch name and
+  falls back to a ticket id in your prompt (weak — see above). Ticketless work is
+  tracked only when you `/claude-whiteboard:claim` a label — there is deliberately
+  no fuzzy free-text sniffing.
+- **A weak ticket sticks.** Once a session with no worktree evidence has a
+  prompt-sniffed ticket, later prompts never change it; only moving into a
+  matching worktree does. Prose can trip the default regex (`UTF-8`, `ISO-8601`,
+  `RFC-7231` all match), and that value then sits on the board for the rest of the
+  session. Use `@wb-ignore` on prompts that merely discuss tickets, and tighten
+  `CC_WHITEBOARD_TICKET_RE` if your prompts are full of such tokens.
+- **`@wb-ignore` skips the heartbeat too.** It writes nothing at all, so a session
+  whose *every* prompt carries the marker can age past the TTL and drop off the
+  board. Any normal prompt puts it back.
 - **Concurrency-safe.** Writes are serialized with a portable `mkdir` lock (no
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
+
+## Changelog
+
+### 0.2.2
+
+- **Fix: prompt mentions no longer claim tickets.** Ticket evidence is now ranked
+  — worktree/branch name (strong) beats a ticket id sniffed from prompt text
+  (weak), and a weak value never overwrites an existing ticket. Previously the
+  first ticket-looking token in *any* prompt became the session's ticket, so
+  pasting coordination text that mentioned `ETHENAPAYF-1013` tagged that session
+  as owning 1013 and buried the session actually in the `ethenapayf-1013-*`
+  worktree under `⚠ CONFLICT` warnings on every prompt.
+- `⚠ CONFLICT` now fires only when the *other* session's ticket came from a
+  worktree. A mention-only holder produces a one-line note instead.
+- **Each overlap is announced once**, not on every prompt, for as long as the
+  ticket and the holder stay the same.
+- Conflict messages now include the holder's directory alongside the branch.
+- New `@wb-ignore` marker — a prompt containing it is skipped entirely.
+- Sessions record `ticket_src` (`worktree` / `prompt`) in the registry.
+- **Worktree ticket detection is no longer hard-coded to one project prefix**; it
+  uses `CC_WHITEBOARD_TICKET_RE`, so `jira-12-login-fix` and `feature/ETHEN-447`
+  are detected too.
+- Fixed: `@wb-ignore` and `@wb-release` were silently ignored on prompts larger
+  than the pipe buffer (~64 KiB). `grep -q` exits at the first match, killing the
+  upstream `printf` with `SIGPIPE`, and under `pipefail` that turned a match into
+  a non-zero status — exactly on the giant pasted dumps the marker exists for.
+- Added `tests/on-prompt.test.sh` (bash + jq, 46 assertions, no Claude Code
+  restart needed).
+
+### 0.2.1
+
+- Auto-detect the ticket from the worktree dir / branch name when the prompt
+  never mentions it.
+
+### 0.2.0
+
+- Keyword label claim for ticketless work (`/claude-whiteboard:claim`).
+
+## Development
+
+```bash
+bash tests/on-prompt.test.sh
+```
 
 ## License
 

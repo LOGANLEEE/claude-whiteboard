@@ -1,6 +1,6 @@
 {
   "name": "claude-whiteboard",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "description": "Shared whiteboard for parallel Claude Code sessions. Each session posts what ticket it is working on to a shared registry; other sessions read it at startup and on every prompt, and are warned before doing double-work. Zero steady-state token cost.",
   "author": { "name": "Logan Lee" },
   "homepage": "https://github.com/LOGANLEEE/claude-whiteboard",

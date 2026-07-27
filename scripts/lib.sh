@@ -76,15 +76,26 @@ wb_read_fresh() {
 # Short session id for display.
 wb_short() { printf '%s' "${1:0:8}"; }
 
-# Derive a ticket id from worktree dir / branch names passed as args.
-# "ethenapayf-1003-history-window" -> ETHENAPAYF-1003. Prints nothing if no match.
+# Derive a ticket id from worktree dir / branch names passed as args, using the
+# same id shape as prompt sniffing so every tracker works, not just one project:
+#   "ethenapayf-1003-history-window" -> ETHENAPAYF-1003
+#   "jira-12-login-fix"              -> JIRA-12
+#   "feature/ETHEN-447"              -> ETHEN-447
+# Prints nothing if no match. Tighten CC_WHITEBOARD_TICKET_RE if a directory
+# naming scheme produces false hits (e.g. "portfolio-2024" -> PORTFOLIO-2024).
 wb_ticket_from_names() {
-  local name m
+  local name up m
   for name in "$@"; do
     [ -n "$name" ] || continue
-    m="$(printf '%s' "$name" | grep -oiE '(ethenapayf|ethen)-?[0-9]+' | head -n1 || true)"
+    up="$(printf '%s' "$name" | tr '[:lower:]' '[:upper:]')"
+    m="$(grep -oE "$WB_TICKET_RE" <<< "$up" | head -n1 || true)"
+    # Fallback: hyphenless project ids ("ethenapayf1003").
+    if [ -z "$m" ]; then
+      m="$(grep -oE '(ETHENAPAYF|ETHEN)[0-9]+' <<< "$up" | head -n1 \
+           | sed -E 's/^(ETHENAPAYF|ETHEN)/\1-/' || true)"
+    fi
     if [ -n "$m" ]; then
-      printf '%s' "$m" | tr '[:lower:]' '[:upper:]' | sed -E 's/^(ETHENAPAYF|ETHEN)-?/\1-/'
+      printf '%s' "$m"
       return 0
     fi
   done

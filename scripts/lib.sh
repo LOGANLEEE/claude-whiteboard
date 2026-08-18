@@ -15,6 +15,11 @@ WB_TICKET_RE="${CC_WHITEBOARD_TICKET_RE:-[A-Z][A-Z0-9]+-[0-9]+}"
 # A session entry older than this many seconds is treated as stale (crash safety).
 WB_TTL="${CC_WHITEBOARD_TTL:-14400}"   # 4h
 
+# Native peer registry, written by Claude Code itself: one <pid>.json per live
+# session carrying the SAME session id hooks receive, plus the `name` that
+# SendMessage({to: ...}) addresses. Read-only join target — we never write here.
+WB_SESSIONS_DIR="${CC_WHITEBOARD_SESSIONS_DIR:-$HOME/.claude/sessions}"
+
 WB_LOCK="${WB_REGISTRY}.lock"
 
 # --- Helpers ---------------------------------------------------------------
@@ -71,6 +76,34 @@ wb_read_fresh() {
   jq -c --argjson cutoff "$cutoff" \
     '.sessions |= with_entries(select(.value.updated >= $cutoff))' \
     "$WB_REGISTRY" 2>/dev/null || printf '{"sessions":{}}'
+}
+
+# Lookup of native SendMessage addresses, keyed by session id:
+#   {"07a7860e-...":{"name":"1276","status":"busy"}, ...}
+# Joined at render time and never stored, so a renamed session stays reachable
+# and the whiteboard keeps owning only its own data. Prints {} when the directory
+# is absent (older Claude Code, another machine) — every caller then renders
+# exactly what it rendered before peers existed.
+# ponytail: one `jq -s` over the whole directory. A single half-written session
+# file drops peer names for that one render; per-file jq would isolate it at the
+# cost of ~60x the process spawns.
+wb_peer_names() {
+  local out
+  # Positional params, not a bash array: `${arr[0]}` is empty under zsh, and this
+  # file gets sourced by hand often enough that the difference bites.
+  set -- "$WB_SESSIONS_DIR"/*.json
+  # Unmatched glob stays literal, so this covers "no files" and "no directory".
+  # Checking it up front matters: `jq -s` over zero readable inputs still prints
+  # {} AND exits non-zero, so a bare `|| printf '{}'` would emit "{}{}".
+  [ -e "$1" ] || { printf '{}'; return 0; }
+  out="$(jq -s 'map(select((.sessionId // "") != "" and (.name // "") != ""))
+         | sort_by(.updatedAt // 0)
+         | map({key: .sessionId, value: {name: .name, status: (.status // "")}})
+         | from_entries' "$@" 2>/dev/null)" || out=""
+  case "$out" in
+    '{'*) printf '%s' "$out" ;;
+    *)    printf '{}' ;;
+  esac
 }
 
 # Short session id for display.

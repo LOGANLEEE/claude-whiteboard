@@ -9,7 +9,8 @@ and do the **same work twice**. Git worktrees isolate *files*; they do nothing a
 
 Each session posts what ticket it's working on to a shared JSON file. Every other
 session reads that file at startup and on every prompt, and is **warned before
-starting work another session already owns**.
+starting work another session already owns** — and told **how to reach the session
+that owns it**, so the two can settle it between themselves.
 
 > Not orchestration — no lead, no workers. Just a whiteboard equal peers read and write.
 
@@ -17,7 +18,7 @@ starting work another session already owns**.
 
 | Hook | What it does |
 |------|--------------|
-| `SessionStart` | Registers this session and injects the list of *other* active sessions into context. |
+| `SessionStart` | Registers this session and injects the list of *other* active sessions into context, each with the address you can message it on. |
 | `UserPromptSubmit` | Works out this session's current ticket (see [Ticket evidence](#ticket-evidence-mention--work)) plus any claimed **label**, records it, and — **only if another live session demonstrably owns that same ticket or label** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
 | `SessionEnd` | Removes this session (ticket and label) and prunes stale (crashed) entries past the TTL. |
 
@@ -88,12 +89,49 @@ ids, so a warning always means a real overlap. There is no fuzzy free-text
 matching (that would fire false conflicts and erode trust in the warning). Ticket
 detection is unchanged; a prompt can carry both a ticket and a claimed label.
 
+### Talking to the session that owns it
+
+A warning that names a stranger is only half an answer. Every board row also
+carries that session's **peer name** — the address Claude Code's own
+`SendMessage` tool delivers to — so the agent can ask the other session what it
+has already done instead of routing the question back through you:
+
+```
+- 07a7860e  ticket: ETHENAPAYF-1013  dir: ethenapayf-1013-kyc-camera  peer: 1013 (busy)
+```
+
+```
+[claude-whiteboard] ⚠ CONFLICT: ticket "ETHENAPAYF-1013" is already being worked on …
+That session is reachable: SendMessage({to: "1013", message: "..."}) — ask what it
+has already done before you touch anything.
+```
+
+The name comes from Claude Code's own session registry (`~/.claude/sessions/*.json`),
+joined against the board **at render time** on the session id both sides already
+record. Nothing is copied into the whiteboard's registry, so a session you rename
+stays reachable and the board never serves a stale address.
+
+Consequences worth knowing:
+
+- **No new transport.** The whiteboard does not move messages; `SendMessage` does.
+  The board only tells you the address.
+- **Older Claude Code, or no session registry** — rows simply render without
+  `peer:`, exactly as they did before. Nothing errors.
+- **A session Claude Code has not named** gets no address line.
+- **Duplicate names are possible** (two sessions can both be called `avax`). The
+  board prints the name and the directory; `SendMessage` itself asks you to
+  disambiguate when the name is ambiguous. The 6-hex `[ref]` that `ListAgents`
+  prints is *not* stored in the session registry, so the board cannot offer it.
+- **A mention-only note gets no address**, deliberately — it stays one line.
+
 ### Token cost
 
 Effectively **zero in steady state**. Hooks are shell scripts (no model tokens to
 run). The only context cost is text a hook injects: a small list once at
-`SessionStart`, and a one-line warning **only when a real conflict is detected**.
-No conflict → nothing injected.
+`SessionStart` (peer names add roughly 8 tokens per listed session), and a
+one-line warning **only when a real conflict is detected**. No conflict → nothing
+injected. The address lookup runs only when a conflict is actually found, so an
+ordinary prompt never pays for it.
 
 ## Install
 
@@ -117,11 +155,12 @@ claude --plugin-dir ./claude-whiteboard
 |-----|---------|---------|
 | `CC_WHITEBOARD_REGISTRY` | `$CLAUDE_PLUGIN_DATA/whiteboard/registry.json` (falls back to `~/.claude/...`) | Where the shared registry lives. Point several sessions at the same path (default already does). Set to a repo-local path if you want per-repo boards. |
 | `CC_WHITEBOARD_TICKET_RE` | `[A-Z][A-Z0-9]+-[0-9]+` | Regex used to detect a ticket id, both in a prompt and (case-insensitively) in the worktree dir / branch name. Matches `ETHEN-447`, `JIRA-12`, etc. Tighten it if your naming produces false hits — e.g. a directory called `portfolio-2024` reads as ticket `PORTFOLIO-2024`. |
+| `CC_WHITEBOARD_SESSIONS_DIR` | `~/.claude/sessions` | Where Claude Code keeps its own per-session JSON files. Read-only — the plugin joins against it to learn each peer's `SendMessage` name. Point it elsewhere (or at an empty directory) to turn the address lookup off. |
 | `CC_WHITEBOARD_TTL` | `14400` (4h) | Entries older than this are treated as stale and pruned (crash safety). |
 
 ## Commands
 
-- `/claude-whiteboard:status` — print the current board (active sessions, tickets, labels, branches, last-seen age).
+- `/claude-whiteboard:status` — print the current board (active sessions, tickets, labels, branches, peer names, last-seen age).
 - `/claude-whiteboard:claim <label>` — claim a free-text label for ticketless work so other sessions are warned off it.
 - `/claude-whiteboard:release` — drop this session's claimed label.
 
@@ -142,10 +181,30 @@ claude --plugin-dir ./claude-whiteboard
 - **`@wb-ignore` skips the heartbeat too.** It writes nothing at all, so a session
   whose *every* prompt carries the marker can age past the TTL and drop off the
   board. Any normal prompt puts it back.
+- **The address is a pointer, not a channel.** The board tells a session where to
+  reach another one; delivery is entirely `SendMessage`'s job. If that tool is
+  unavailable the row is just informational.
 - **Concurrency-safe.** Writes are serialized with a portable `mkdir` lock (no
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 
 ## Changelog
+
+### 0.3.0
+
+- **Every board row now carries the peer's `SendMessage` address**, so a session
+  that finds an overlap can talk to the session that owns it instead of handing
+  the problem back to you. `SessionStart` rows gain `peer: <name> (busy|idle)`,
+  `⚠ CONFLICT` gains the exact `SendMessage({to: ...})` call for the holder, and
+  `/claude-whiteboard:status` gains a `PEER` column.
+- The name is joined from Claude Code's own `~/.claude/sessions/*.json` **at
+  render time**, keyed on the session id both sides already record. Nothing new
+  is stored, so a renamed session cannot go stale on the board.
+- Degrades silently everywhere it can't resolve: no session registry, an unnamed
+  session, or a half-written session file all render exactly the pre-0.3.0
+  output with a clean stderr.
+- A mention-only note deliberately stays one line — no address.
+- New `CC_WHITEBOARD_SESSIONS_DIR` env var (also what makes the join testable).
+- Tests: 56 assertions, up from 46.
 
 ### 0.2.2
 

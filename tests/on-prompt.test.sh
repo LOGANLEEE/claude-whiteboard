@@ -8,12 +8,28 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HOOK="$ROOT/scripts/on-prompt.sh"
 
 # Don't let a developer's shell config decide the result.
-unset CC_WHITEBOARD_TICKET_RE CC_WHITEBOARD_TTL
+unset CC_WHITEBOARD_TICKET_RE CC_WHITEBOARD_TTL CC_WHITEBOARD_SESSIONS_DIR
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export CC_WHITEBOARD_REGISTRY="$WORK/registry.json"
 ERRLOG="$WORK/stderr"
+
+# Fake stand-in for Claude Code's own session registry (~/.claude/sessions),
+# which is where the SendMessage address of each peer comes from. Pointing at a
+# throwaway copy keeps the suite off the developer's real, live sessions.
+SESSDIR="$WORK/sessions"
+mkdir -p "$SESSDIR"
+peerfile() {  # peerfile <session-id> <name|""> <status>
+  jq -n --arg s "$1" --arg n "$2" --arg st "$3" \
+    '{sessionId:$s, kind:"interactive", status:$st, updatedAt:1}
+     + (if $n != "" then {name:$n} else {} end)' > "$SESSDIR/$1.json"
+}
+peerfile OWNER   owner-peer   busy
+peerfile MENTION mention-peer idle
+peerfile L1      label-peer   idle
+peerfile NONAME  ""           idle   # a session Claude Code has not named
+export CC_WHITEBOARD_SESSIONS_DIR="$SESSDIR"
 
 WT="$WORK/ethenapayf-1013-kyc-camera"    # worktree-looking dir, not a git repo
 WT2="$WORK/ethenapayf-1013-dup"
@@ -81,6 +97,7 @@ out="$(run WORKER "$WT" "continue the camera work")"
 hasnt "mention-only holder raises no CONFLICT" "CONFLICT" "$out"
 has  "mention-only holder produces a note" "also mentioned ETHENAPAYF-1013." "$out"
 eq   "note is one line" "1" "$(printf '%s\n' "$out" | wc -l | tr -d ' ')"
+hasnt "a mention-only holder gets no address line" "SendMessage" "$out"
 eq   "mention holder recorded as weak" "prompt" "$(q '.sessions.MENTION.ticket_src')"
 
 # --- 6. two worktree sessions on one ticket DO conflict, with dir ----------
@@ -90,6 +107,8 @@ out="$(run SECOND "$WT2" "same ticket here")"
 has "worktree-vs-worktree raises conflict" "CONFLICT" "$out"
 has "conflict names the ticket" "ETHENAPAYF-1013" "$out"
 has "conflict shows holder dir" "dir: ethenapayf-1013-kyc-camera" "$out"
+has "conflict carries the holder's SendMessage address" \
+    'SendMessage({to: "owner-peer"' "$out"
 
 # --- 7. the same conflict is announced once, not on every prompt -----------
 out="$(run SECOND "$WT2" "still the same ticket")"
@@ -170,6 +189,7 @@ eq "a lone claimer never warns about itself" "" "$out"
 out="$(run L2 "$PLAIN" "@wb-claim: Auth Refactor")"
 has "label conflict is case-insensitive" 'label "Auth Refactor"' "$out"
 has "label conflict shows holder dir" "dir: ethenapayf-1013-kyc-camera" "$out"
+has "label conflict carries the holder's address" 'SendMessage({to: "label-peer"' "$out"
 run L1 "$WT" "@wb-release" >/dev/null
 eq "@wb-release clears the label" "null" "$(q '.sessions.L1.label')"
 BIGREL="$(python3 -c "print('@wb-release'); print('filler line ' * 8000)")"
@@ -184,7 +204,34 @@ eq "no evidence -> no output" "" "$out"
 eq "no evidence -> no ticket" "null" "$(q '.sessions.Q.ticket // "null"')"
 eq "no evidence -> heartbeat written" "$(basename "$PLAIN")" "$(q '.sessions.Q.dir')"
 
-# --- 17. registry stays valid JSON ----------------------------------------
+# --- 17. peer bridge degrades instead of breaking --------------------------
+# A holder Claude Code never named: conflict still fires, no address offered.
+reset
+run NONAME "$WT" "kyc camera work" >/dev/null
+out="$(run N2 "$WT2" "same ticket")"
+has   "unnamed holder still raises a conflict" "CONFLICT" "$out"
+hasnt "unnamed holder offers no address" "SendMessage" "$out"
+
+# No native session registry at all (older Claude Code, another machine).
+export CC_WHITEBOARD_SESSIONS_DIR="$WORK/absent-sessions-dir"
+reset
+run OWNER "$WT" "kyc camera work" >/dev/null
+out="$(run N3 "$WT2" "same ticket")"
+has   "conflict survives a missing session registry" "CONFLICT" "$out"
+hasnt "missing session registry offers no address" "SendMessage" "$out"
+eq    "missing session registry keeps stderr clean" "" "$(cat "$ERRLOG")"
+
+# A half-written session file must not take the address lookup down with it.
+export CC_WHITEBOARD_SESSIONS_DIR="$SESSDIR"
+printf 'not json{' > "$SESSDIR/torn.json"
+reset
+run OWNER "$WT" "kyc camera work" >/dev/null
+out="$(run N4 "$WT2" "same ticket")"
+has "a torn session file still leaves the conflict intact" "CONFLICT" "$out"
+eq  "a torn session file keeps stderr clean" "" "$(cat "$ERRLOG")"
+rm -f "$SESSDIR/torn.json"
+
+# --- 18. registry stays valid JSON ----------------------------------------
 jq -e . "$CC_WHITEBOARD_REGISTRY" >/dev/null 2>&1 \
   && ok "registry is valid JSON" || bad "registry is valid JSON" "valid" "invalid"
 

@@ -158,6 +158,17 @@ emit_note() {
   echo "[claude-whiteboard] note: session ${2:0:8}$where also mentioned $1."
 }
 
+# Native SendMessage address for a session, when Claude Code knows one. Emitted
+# as a follow-up to a hard conflict so the session that just found the overlap
+# can settle it directly instead of asking the user to relay. Looked up lazily —
+# the common prompt never reaches here, so it costs nothing in steady state.
+emit_peer_hint() {
+  local name
+  name="$(wb_peer_names | jq -r --arg s "$1" '.[$s].name // ""' 2>/dev/null || true)"
+  [ -n "$name" ] && printf 'That session is reachable: SendMessage({to: "%s", message: "..."}) — ask what it has already done before you touch anything.\n' "$name"
+  return 0
+}
+
 # Read a holder emitted by jq (see WB_HOLDER): one field per line. A single
 # delimited line does not work — "|" is legal in a directory and a branch name,
 # and TAB is IFS whitespace, so bash collapses an empty field and shifts the rest.
@@ -186,8 +197,10 @@ if [ -n "$ticket" ]; then
   read_holder "$holder"
   if [ -n "$other_sid" ]; then
     if [ "$other_src" = "worktree" ]; then
-      first_time "T:$ticket:$other_sid:hard" \
-        && emit_conflict "ticket" "$ticket" "$other_sid" "$other_dir" "$other_branch"
+      if first_time "T:$ticket:$other_sid:hard"; then
+        emit_conflict "ticket" "$ticket" "$other_sid" "$other_dir" "$other_branch"
+        emit_peer_hint "$other_sid"
+      fi
     else
       first_time "T:$ticket:$other_sid:soft" \
         && emit_note "$ticket" "$other_sid" "$other_dir"
@@ -206,8 +219,10 @@ if [ -n "$label" ]; then
     <<< "$fresh" 2>/dev/null)"
   read_holder "$holder"
   if [ -n "$other_sid" ]; then
-    first_time "L:$label:$other_sid" \
-      && emit_conflict "label" "$label" "$other_sid" "$other_dir" "$other_branch"
+    if first_time "L:$label:$other_sid"; then
+      emit_conflict "label" "$label" "$other_sid" "$other_dir" "$other_branch"
+      emit_peer_hint "$other_sid"
+    fi
   fi
 fi
 

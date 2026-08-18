@@ -13,7 +13,9 @@ fi
 echo "claude-whiteboard registry: $WB_REGISTRY"
 echo
 
-rows="$(wb_read_fresh | jq -r --arg now "$(wb_now)" '
+peers="$(wb_peer_names)"
+
+rows="$(wb_read_fresh | jq -r --arg now "$(wb_now)" --argjson peers "$peers" '
   .sessions | to_entries
   | sort_by(.value.updated) | reverse
   | map(
@@ -22,6 +24,7 @@ rows="$(wb_read_fresh | jq -r --arg now "$(wb_now)" '
       + "\t" + (if .value.ticket then (.value.ticket_src // "prompt") else "-" end)
       + "\t" + ((.value.label // "") | if . == "" then "-" else . end)
       + "\t" + ((.value.branch // "") | if . == "" then "-" else . end)
+      + "\t" + ((($peers[.key] // {}).name // "") | if . == "" then "-" else . end)
       + "\t" + (((($now|tonumber) - .value.updated) / 60) | floor | tostring) + "m ago"
     )
   | .[]' 2>/dev/null)"
@@ -31,5 +34,5 @@ if [ -z "$rows" ]; then
   exit 0
 fi
 
-printf 'SESSION\tTICKET\tSRC\tLABEL\tBRANCH\tLAST SEEN\n'
+printf 'SESSION\tTICKET\tSRC\tLABEL\tBRANCH\tPEER\tLAST SEEN\n'
 printf '%s\n' "$rows"

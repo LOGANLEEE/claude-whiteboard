@@ -46,8 +46,11 @@ wb_update \
   --arg sid "$sid" --arg cwd "$cwd" --arg dir "$dir" --arg branch "$branch" \
   --arg ticket "$ticket" --arg now "$now"
 
+# Native SendMessage addresses, joined in at render time (never stored).
+peers="$(wb_peer_names)"
+
 # Build the "others" view (fresh only, excluding self).
-others="$(wb_read_fresh | jq -r --arg self "$sid" '
+others="$(wb_read_fresh | jq -r --arg self "$sid" --argjson peers "$peers" '
   .sessions | to_entries
   | map(select(.key != $self))
   | map("- " + (.key[0:8])
@@ -58,7 +61,12 @@ others="$(wb_read_fresh | jq -r --arg self "$sid" '
            else "  ticket: (none yet)" end)
         + (if .value.label  and .value.label != "" then "  label: " + .value.label else "" end)
         + (if .value.dir    and .value.dir    != "" then "  dir: " + .value.dir else "" end)
-        + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end))
+        + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end)
+        + (($peers[.key] // {}) as $p
+           | if ($p.name // "") != ""
+             then "  peer: " + $p.name
+                  + (if ($p.status // "") != "" then " (" + $p.status + ")" else "" end)
+             else "" end))
   | .[]' 2>/dev/null)"
 
 if [ -n "$others" ]; then
@@ -69,6 +77,13 @@ $others
 Before starting a ticket, avoid one already listed above (another session is on it).
 If your work overlaps one of these, pause and tell the user rather than doing double-work.
 EOF
+  # A row with a peer name is directly reachable: Claude Code can message that
+  # session itself, so coordinating does not have to go through the user.
+  case "$others" in
+    *"  peer: "*)
+      echo 'A row with "peer:" can be messaged directly — SendMessage({to: "<peer>", message: "..."}) — to ask what it is doing, hand work over, or warn it off.'
+      ;;
+  esac
 else
   echo "[claude-whiteboard] No other active sessions. You're clear to pick any ticket."
 fi

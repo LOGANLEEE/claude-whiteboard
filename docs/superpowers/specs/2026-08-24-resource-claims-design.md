@@ -176,11 +176,25 @@ peerFeatures, peerProtocol, pid, procStart, sessionId, startedAt, status,
 statusUpdatedAt, updatedAt, version
 ```
 
-A hold is dead when any of these is true:
+A hold is dead when the session registry is **readable** and any of these is true:
 
 1. No session file carries that `sessionId`.
 2. `kill -0 <pid>` fails.
 3. `TZ=UTC ps -o lstart= -p <pid>` (trimmed) ≠ the stored `procStart` — PID reuse.
+
+**The instrument must be proven able to see before its silence counts.** If the
+session directory is missing or contains no readable session file, liveness is
+`unknown`, not `dead`. Layer 1 is then skipped entirely and holds expire only on
+the existing session TTL.
+
+Without this guard the feature inverts on any machine with no session registry:
+every holder reads as dead, every hold is reclaimed, and the locking silently
+stops working while still reporting success. An empty result proves nothing until
+the instrument is shown to work.
+
+Rule 3 also degrades to `unknown` rather than `dead` when `ps` yields nothing for
+a PID that `kill -0` accepted, and rule 3 is skipped when `procStart` was never
+recorded.
 
 Verified this session:
 
@@ -432,6 +446,9 @@ Claude Code restart required):
     on stderr, hold recorded.
 17. Soft hold taken by a session that never waited → allowed.
 18. Session end while holding a resource → hold gone, waiters' `until` set.
+19. Empty `CC_WHITEBOARD_SESSIONS_DIR` → hold **kept**, not reclaimed. This is
+    the guard against the feature inverting where no session registry exists.
+20. `ps` returns nothing for a PID that `kill -0` accepted → hold kept.
 
 Liveness tests inject a fake `CC_WHITEBOARD_SESSIONS_DIR` with hand-written
 session files, so no real Claude session is needed.

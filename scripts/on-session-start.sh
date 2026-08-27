@@ -60,6 +60,8 @@ others="$(wb_read_fresh | jq -r --arg self "$sid" --argjson peers "$peers" '
                    else " (mentioned, not confirmed by a worktree)" end)
            else "  ticket: (none yet)" end)
         + (if .value.label  and .value.label != "" then "  label: " + .value.label else "" end)
+        + (((.value.holds // {}) | keys) as $h
+           | if ($h | length) > 0 then "  uses: " + ($h | join(", ")) else "" end)
         + (if .value.dir    and .value.dir    != "" then "  dir: " + .value.dir else "" end)
         + (if .value.branch and .value.branch != "" then "  branch: " + .value.branch else "" end)
         + (($peers[.key] // {}) as $p
@@ -82,6 +84,13 @@ EOF
   case "$others" in
     *"  peer: "*)
       echo 'A row with "peer:" can be messaged directly — SendMessage({to: "<peer>", message: "..."}) — to ask what it is doing, hand work over, or warn it off.'
+      ;;
+  esac
+  # A shared singleton is not a double-work warning: taking it corrupts their
+  # run rather than duplicating it, so the answer is to ask, not to work around.
+  case "$others" in
+    *"  uses: "*)
+      echo 'A row with "uses:" holds that shared resource. A command that would take it is blocked until they release it — ask that session rather than working around the block.'
       ;;
   esac
 else

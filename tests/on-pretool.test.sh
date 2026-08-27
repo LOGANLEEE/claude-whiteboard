@@ -241,5 +241,45 @@ eq "session end opened the waiter window" "true" \
    "$(jq --argjson n "$(date +%s)" \
         '.sessions.B.waits["local-stack@repo-one"].until > $n' "$CC_WHITEBOARD_REGISTRY")"
 
+# --- 19. board rendering ---------------------------------------------------
+# Rendering runs on every SessionStart, so a crash here has a wide blast radius.
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$NOW" --arg h "$((NOW - 720))" --arg w "$((NOW - 180))" \
+  '{sessions:{
+     A:{updated:($u|tonumber), started:($u|tonumber), dir:"backend",
+        holds:{"local-stack@wallet":($h|tonumber)}},
+     B:{updated:($u|tonumber), started:($u|tonumber), dir:"wt-161",
+        waits:{"local-stack@wallet":{since:($w|tonumber), until:0}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"; strc=$?
+eq  "status.sh exits 0"            "0" "$strc"
+has "status lists the resource"    "local-stack@wallet" "$st"
+has "status has a RESOURCE header" "RESOURCE"           "$st"
+has "status shows hold age"        "12m"                "$st"
+has "status names the waiter"      "alpha"              "$st"
+
+ss="$(jq -nc --arg c "$R1" '{session_id:"C", cwd:$c, source:"startup"}' \
+      | bash "$ROOT/scripts/on-session-start.sh" 2>&1)"; ssrc=$?
+eq  "on-session-start exits 0"  "0" "$ssrc"
+has "row carries uses:"         "uses: local-stack@wallet" "$ss"
+has "uses: is explained"        "blocked until they release it" "$ss"
+
+# A session that holds nothing must still render the section, saying so rather
+# than printing a bare header.
+reset
+jq -n --arg u "$(date +%s)" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"backend"}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"
+has "a board with no holds says so" "No shared resources claimed." "$st"
+
+# A wholly empty board exits at "No active sessions." before the resource
+# section — correct, since holds live inside session entries and there are none.
+reset
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"
+has "empty board short-circuits" "No active sessions." "$st"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

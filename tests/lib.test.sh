@@ -81,5 +81,46 @@ CC_WHITEBOARD_SESSIONS_DIR="$EMPTY" \
            wb_session_alive ANY "$(wb_live_pids)" && echo ALIVE || echo DEAD' > "$WORK/o"
 eq "unknown liveness treats any session as ALIVE" "ALIVE" "$(cat "$WORK/o")"
 
+# --- resource config + command matching ------------------------------------
+eq "default map has local-stack" "true"  "$(wb_resources | jq 'has("local-stack")')"
+eq "default map has xcode"       "true"  "$(wb_resources | jq 'has("xcode")')"
+
+m() { wb_match_resources "$1" "${2:-claim}" | tr '\n' ',' ; }
+
+eq "docker compose up claims local-stack" "local-stack," "$(m 'docker compose up -d')"
+eq "docker-compose up claims too"         "local-stack," "$(m 'docker-compose up')"
+eq "ngrok claims local-stack"             "local-stack," "$(m 'ngrok http 8080')"
+eq "docker compose ps claims nothing"     ""             "$(m 'docker compose ps')"
+eq "mongrokker is not ngrok"              ""             "$(m 'cat mongrokker.log')"
+eq "xcodebuild claims xcode"              "xcode,"       "$(m 'xcodebuild -scheme App')"
+eq "simctl boot claims xcode"             "xcode,"       "$(m 'xcrun simctl boot ABC')"
+eq "docker compose down releases"    "local-stack," "$(m 'docker compose down' release)"
+eq "docker compose down does not claim" ""          "$(m 'docker compose down')"
+eq "ls claims nothing"                    ""             "$(m 'ls -la')"
+
+out="$(m 'docker compose up -d && xcodebuild -scheme App')"
+case "$out" in
+  *local-stack*) case "$out" in
+      *xcode*) ok "compound command matches both";;
+      *) bad "compound command matches both" "both" "$out";; esac;;
+  *) bad "compound command matches both" "both" "$out";;
+esac
+
+CC_WHITEBOARD_RESOURCES='{"db":{"claim":"just +db::migrate","release":"","probe":""}}' \
+  bash -c 'source "'"$ROOT"'/scripts/lib.sh"
+           wb_match_resources "just db::migrate" claim' > "$WORK/o"
+eq "env override replaces the map" "db" "$(cat "$WORK/o")"
+
+# --- probe: three-valued ---------------------------------------------------
+probe_rc() {  # probe_rc <probe-command>
+  CC_WHITEBOARD_RESOURCES="$(jq -nc --arg p "$1" \
+      '{r:{claim:"never-matches-anything",release:"",probe:$p}}')" \
+    bash -c 'source "'"$ROOT"'/scripts/lib.sh"; wb_probe r; echo $?' | tail -1
+}
+eq "probe exit 0 means UP"          "0" "$(probe_rc 'true')"
+eq "probe non-zero means DOWN"      "1" "$(probe_rc 'false')"
+eq "no probe configured is UNKNOWN" "2" "$(probe_rc '')"
+eq "unrunnable probe is UNKNOWN"    "2" "$(probe_rc '/nonexistent/binary/xyz')"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

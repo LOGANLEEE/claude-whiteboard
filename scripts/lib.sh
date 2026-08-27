@@ -208,3 +208,65 @@ wb_session_alive() {
   [ -n "$pid" ] || return 1
   wb_pid_alive "$pid" "$ps"
 }
+
+# Resource pattern map. Shipped defaults stay GENERIC: this plugin is public, so
+# project-specific recipes (just stack::up, just db::migrate) belong in a user's
+# CC_WHITEBOARD_RESOURCES override, not here.
+#   claim   ERE -> running this takes the resource
+#   release ERE -> running this gives it back
+#   probe   shell command, exit 0 = the resource is really up ("" = no probe)
+WB_RESOURCES_DEFAULT='{
+  "local-stack": {
+    "claim":   "docker[- ]compose\\b.*\\bup\\b|\\bngrok\\b",
+    "release": "docker[- ]compose\\b.*\\bdown\\b",
+    "probe":   ""
+  },
+  "xcode": {
+    "claim":   "\\bxcodebuild\\b|xcrun +simctl +(boot|install|launch)",
+    "release": "xcrun +simctl +shutdown",
+    "probe":   ""
+  }
+}'
+WB_HOLD_IDLE="${CC_WHITEBOARD_HOLD_IDLE:-3600}"
+WB_RESERVE="${CC_WHITEBOARD_RESERVE:-300}"
+WB_WAIT_TTL="${CC_WHITEBOARD_WAIT_TTL:-7200}"
+WB_PROBE_TIMEOUT="${CC_WHITEBOARD_PROBE_TIMEOUT:-2}"
+
+wb_resources() { printf '%s' "${CC_WHITEBOARD_RESOURCES:-$WB_RESOURCES_DEFAULT}"; }
+
+# Bare resource names whose <action> pattern matches <command>, one per line.
+# One command can match several resources; the caller must treat that as an
+# all-or-nothing set, never as independent claims.
+wb_match_resources() {
+  local cmd="$1" action="${2:-claim}" name re res
+  res="$(wb_resources)"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    re="$(jq -r --arg n "$name" --arg a "$action" '.[$n][$a] // ""' <<< "$res" 2>/dev/null)"
+    [ -n "$re" ] || continue
+    # Here-string, not printf|grep: grep -q exits at the first match and SIGPIPEs
+    # the writer, which under pipefail turns a MATCH into a failure on long input.
+    if grep -qE "$re" <<< "$cmd" 2>/dev/null; then printf '%s\n' "$name"; fi
+  done <<< "$(jq -r 'keys[]' <<< "$res" 2>/dev/null)"
+  return 0
+}
+
+# 0 = up, 1 = down, 2 = unknown. Unknown must never release a hold: a probe we
+# could not run is silence from a blind instrument, not evidence of absence.
+wb_probe() {
+  local cmd rc
+  cmd="$(wb_resources | jq -r --arg n "$1" '.[$n].probe // ""' 2>/dev/null)"
+  [ -n "$cmd" ] || return 2
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$WB_PROBE_TIMEOUT" sh -c "$cmd" >/dev/null 2>&1
+  else
+    sh -c "$cmd" >/dev/null 2>&1
+  fi
+  rc=$?
+  case "$rc" in
+    0)   return 0 ;;
+    127) return 2 ;;   # command not found -> we learned nothing
+    124) return 2 ;;   # timeout(1) killed it -> we learned nothing
+    *)   return 1 ;;
+  esac
+}

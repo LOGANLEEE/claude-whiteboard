@@ -280,5 +280,25 @@ jq -n --arg u "$NOW" --arg s "$((NOW - 300))" \
 out="$(run OWNER "$PLAIN" "no ticket and no label in this prompt at all")"
 has "notices fire without ticket or label" 'waiting on "xcode@repo"' "$out"
 
+# --- resource markers ------------------------------------------------------
+# Same marker-in-prompt pattern as @wb-claim, for the same reason recorded in
+# the keyword-claim spec: a script invoked from a command body never receives
+# session_id, so only a hook can write the right registry entry.
+reset
+run M1 "$GITWT" "@wb-use: xcode" >/dev/null
+eq "@wb-use records a hold" "true" \
+   "$(q '.sessions.M1.holds | keys | map(startswith("xcode@")) | any')"
+
+run M1 "$GITWT" "@wb-free: xcode" >/dev/null
+eq "@wb-free drops the hold" "0" "$(q '.sessions.M1.holds | length')"
+
+reset
+run M1 "$GITWT" "@wb-use: xcode" >/dev/null
+out="$(run M2 "$GITWT" "@wb-force: xcode")"
+eq  "@wb-force takes it" "true" \
+    "$(q '.sessions.M2.holds | keys | map(startswith("xcode@")) | any')"
+eq  "@wb-force strips the previous holder" "0" "$(q '.sessions.M1.holds | length')"
+has "@wb-force names whom it took from" "M1" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

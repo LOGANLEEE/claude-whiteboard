@@ -107,6 +107,42 @@ elif [ -n "$label" ]; then
     --arg sid "$sid" --arg label "$label" 2>/dev/null || true
 fi
 
+# --- Resource markers ------------------------------------------------------
+# /claude-whiteboard:use, :free and :force emit these. Same marker-in-prompt
+# pattern as @wb-claim, for the reason recorded in the keyword-claim spec: a
+# script invoked from a command body never receives session_id, so only a hook
+# can write the right registry entry.
+marker_arg() {  # marker_arg <marker-name>
+  grep -oE "@wb-$1:.*" <<< "$prompt" | head -n1 \
+    | sed -E "s/^@wb-$1:[[:space:]]*//; s/[[:space:]]+\$//" || true
+}
+r_use="$(marker_arg use)"
+r_free="$(marker_arg free)"
+r_force="$(marker_arg force)"
+
+if [ -n "$r_use" ]; then
+  wb_hold "$sid" "$(wb_resource_name "$r_use" "$cwd")"
+fi
+if [ -n "$r_free" ]; then
+  res_f="$(wb_resource_name "$r_free" "$cwd")"
+  wb_unhold "$sid" "$res_f"
+  wb_open_window "$res_f" "$WB_RESERVE"
+fi
+if [ -n "$r_force" ]; then
+  res_x="$(wb_resource_name "$r_force" "$cwd")"
+  prev="$(jq -r --arg r "$res_x" --arg self "$sid" '
+      .sessions | to_entries
+      | map(select(.key != $self and ((.value.holds // {}) | has($r))))
+      | .[].key' <<< "$(wb_read_fresh)" 2>/dev/null)"
+  for p in $prev; do wb_unhold "$p" "$res_x"; done
+  wb_hold "$sid" "$res_x"
+  if [ -n "$prev" ]; then
+    echo "[claude-whiteboard] forced \"$res_x\" — taken from session(s): $(printf '%s' "$prev" | tr '\n' ' ' | sed 's/ *$//')."
+  else
+    echo "[claude-whiteboard] \"$res_x\" was already free; you hold it now."
+  fi
+fi
+
 # No ticket evidence and no label this prompt -> nothing to CONFLICT-CHECK.
 # This used to exit outright. It cannot any more: a session with no ticket and
 # no label still needs the resource notices below, which are about what it

@@ -178,13 +178,23 @@ CC_WHITEBOARD_RESOURCES='{"local-stack":{"claim":"x","release":"","probe":"true"
            wb_holder_of "local-stack@r" OTHER local-stack | tail -1' > "$WORK/o"
 eq "probe UP keeps an idle hold hard" "hard" "$(cat "$WORK/o")"
 
+# A claim is recorded BEFORE the command runs, so a booting stack legitimately
+# probes DOWN. Only a hold past the startup grace is a phantom.
 reset_reg
 touch_sess LIVE "$NOW"
-wb_hold LIVE "local-stack@r"
+wb_update '.sessions.LIVE.holds = {"local-stack@r": ($t|tonumber)}' --arg t "$((NOW - 9999))"
 CC_WHITEBOARD_RESOURCES='{"local-stack":{"claim":"x","release":"","probe":"false"}}' \
   bash -c 'source "'"$ROOT"'/scripts/lib.sh"
            wb_holder_of "local-stack@r" OTHER local-stack' > "$WORK/o"
-eq "probe DOWN means no holder" "" "$(cat "$WORK/o")"
+eq "probe DOWN + OLD hold means no holder" "" "$(cat "$WORK/o")"
+
+reset_reg
+touch_sess LIVE "$NOW"
+wb_hold LIVE "local-stack@r"          # fresh: still inside the grace window
+CC_WHITEBOARD_RESOURCES='{"local-stack":{"claim":"x","release":"","probe":"false"}}' \
+  bash -c 'source "'"$ROOT"'/scripts/lib.sh"
+           wb_holder_of "local-stack@r" OTHER local-stack | head -1' > "$WORK/o"
+eq "probe DOWN + FRESH hold is a boot in progress, still held" "LIVE" "$(cat "$WORK/o")"
 
 # --- waits and the priority window ----------------------------------------
 reset_reg

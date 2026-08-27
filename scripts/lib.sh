@@ -231,6 +231,12 @@ WB_HOLD_IDLE="${CC_WHITEBOARD_HOLD_IDLE:-3600}"
 WB_RESERVE="${CC_WHITEBOARD_RESERVE:-300}"
 WB_WAIT_TTL="${CC_WHITEBOARD_WAIT_TTL:-7200}"
 WB_PROBE_TIMEOUT="${CC_WHITEBOARD_PROBE_TIMEOUT:-2}"
+# A claim is recorded BEFORE the command runs, so a just-claimed stack is not up
+# yet. Without this, a probe reporting DOWN during boot declares the holder a
+# phantom and lets a second session claim — reintroducing the exact collision the
+# feature prevents. A probe cannot contradict a hold that has not had time to
+# become true.
+WB_PROBE_GRACE="${CC_WHITEBOARD_PROBE_GRACE:-300}"
 
 wb_resources() { printf '%s' "${CC_WHITEBOARD_RESOURCES:-$WB_RESOURCES_DEFAULT}"; }
 
@@ -331,7 +337,6 @@ wb_holder_of() {
 
   pstate=2
   if [ -n "$bare" ]; then wb_probe "$bare"; pstate=$?; fi
-  [ "$pstate" -eq 1 ] && return 0     # probe says DOWN -> nobody holds it
 
   while IFS= read -r line; do
     [ -n "$line" ] || continue
@@ -339,6 +344,11 @@ wb_holder_of() {
     br="$(cut -f3 <<< "$line")";    since="$(cut -f4 <<< "$line")"
     updated="$(cut -f5 <<< "$line")"
     wb_session_alive "$sid" "$lp" || continue      # dead -> phantom, skip
+    # Probe says DOWN: a hold old enough that the resource SHOULD be up by now is
+    # a phantom, but a hold still inside the startup grace is a boot in progress.
+    if [ "$pstate" -eq 1 ] && [ $(( now - since )) -ge "$WB_PROBE_GRACE" ]; then
+      continue
+    fi
     if [ "$pstate" -eq 0 ]; then
       # A probe saying UP outranks idleness: an hour of session silence is
       # normal while the user hand-tests on a device.

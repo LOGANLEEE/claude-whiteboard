@@ -172,11 +172,25 @@ eq  "unattributed resource does not block" "0" "$(rc)"
 has "unattributed resource warns" "unclaimed" "$(err)"
 eq  "claim still recorded" "true" "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
 
-# 12. probe DOWN means the registry's hold is a phantom regardless of liveness.
+# 12. probe DOWN clears a hold only once the startup grace has passed. A claim is
+# recorded BEFORE the command runs, so a booting stack probes DOWN legitimately —
+# clearing it there would let a second session claim mid-boot and collide, which
+# is the exact failure this feature exists to prevent.
 reset
 runp A "$R1" "docker compose up -d" >/dev/null
 runp_env "$DOWN" B "$R1" "docker compose up -d"
-eq "probe DOWN means the hold is a phantom" "0" "$(rc)"
+eq "probe DOWN does NOT evict a booting holder" "2" "$(rc)"
+
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$NOW" --arg t "$((NOW - 9999))" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"repo-one",
+                 holds:{"local-stack@repo-one":($t|tonumber)}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp_env "$DOWN" B "$R1" "docker compose up -d"
+eq "probe DOWN evicts a hold past the grace" "0" "$(rc)"
+eq "the phantom hold was cleared" "false" \
+   "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
 
 # 13. probe UP outranks idleness — an hour of silence is normal while the user
 # hand-tests on a device, and taking the hold then would be exactly wrong.

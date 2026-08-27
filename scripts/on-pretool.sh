@@ -112,11 +112,16 @@ while IFS= read -r bare; do
   # Exit 2 is "unknown" and decides nothing, so only 1 counts.
   prc=0; wb_probe "$bare" || prc=$?
   if [ "$prc" -eq 1 ]; then
+    # Only holds past the startup grace. A claim is recorded BEFORE the command
+    # runs, so a stack that is still booting legitimately probes DOWN; clearing
+    # it there would let a second session claim mid-boot and collide.
     while IFS= read -r ph; do
       [ -n "$ph" ] && wb_unhold "$ph" "$res"
-    done <<< "$(jq -r --arg r "$res" '.sessions | to_entries
-                 | map(select(((.value.holds // {})[$r] // 0) > 0)) | .[].key' \
-                <<< "$(wb_read_fresh)" 2>/dev/null)"
+    done <<< "$(jq -r --arg r "$res" --arg n "$(wb_now)" --arg g "$WB_PROBE_GRACE" '
+                 .sessions | to_entries
+                 | map(select(((.value.holds // {})[$r] // 0) > 0
+                        and (($n|tonumber) - .value.holds[$r]) >= ($g|tonumber)))
+                 | .[].key' <<< "$(wb_read_fresh)" 2>/dev/null)"
   fi
 
   holder="$(wb_holder_of "$res" "$sid" "$bare")"

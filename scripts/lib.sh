@@ -270,3 +270,115 @@ wb_probe() {
     *)   return 1 ;;
   esac
 }
+
+# Claim. Idempotent: re-running the same command must NOT refresh `since`, or an
+# idle holder could hold a resource forever by repeating its own command.
+wb_hold() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {})
+      + {holds: ((.sessions[$s].holds // {})
+                 | if has($r) then . else . + {($r): ($n|tonumber)} end)})' \
+    --arg s "$1" --arg r "$2" --arg n "$(wb_now)" 2>/dev/null || true
+}
+
+wb_unhold() {
+  wb_update 'if .sessions[$s] then .sessions[$s].holds |= (. // {} | del(.[$r])) else . end' \
+    --arg s "$1" --arg r "$2" 2>/dev/null || true
+}
+
+wb_add_wait() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {})
+      + {waits: ((.sessions[$s].waits // {})
+                 | if has($r) then . else . + {($r): {since:($n|tonumber), until:0}} end)})' \
+    --arg s "$1" --arg r "$2" --arg n "$(wb_now)" 2>/dev/null || true
+}
+
+wb_drop_wait() {
+  wb_update 'if .sessions[$s] then .sessions[$s].waits |= (. // {} | del(.[$r])) else . end' \
+    --arg s "$1" --arg r "$2" 2>/dev/null || true
+}
+
+# Give every current waiter a head start over sessions that never waited. This
+# is the whole of "auto-grant": a timestamp, not a state machine. Nobody is
+# assigned ownership, so nobody ends up holding what they no longer want.
+wb_open_window() {
+  local secs="${2:-$WB_RESERVE}"
+  [ "$secs" -gt 0 ] 2>/dev/null || return 0
+  wb_update '.sessions |= with_entries(
+      if (.value.waits // {}) | has($r)
+      then .value.waits[$r].until = (($n|tonumber) + ($s|tonumber))
+      else . end)' \
+    --arg r "$1" --arg n "$(wb_now)" --arg s "$secs" 2>/dev/null || true
+}
+
+# Holder of <resource>, excluding <self>, or nothing when free.
+# Prints 5 lines: sid, dir, branch, since, state(hard|soft). One field per line
+# because "|" is legal in a branch name and TAB is IFS whitespace, either of
+# which would shift the fields on a single delimited line.
+wb_holder_of() {
+  local r="$1" self="$2" bare="${3:-}" fresh lp now line
+  local sid dir br since updated pstate
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"; now="$(wb_now)"
+
+  pstate=2
+  if [ -n "$bare" ]; then wb_probe "$bare"; pstate=$?; fi
+  [ "$pstate" -eq 1 ] && return 0     # probe says DOWN -> nobody holds it
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sid="$(cut -f1 <<< "$line")";   dir="$(cut -f2 <<< "$line")"
+    br="$(cut -f3 <<< "$line")";    since="$(cut -f4 <<< "$line")"
+    updated="$(cut -f5 <<< "$line")"
+    wb_session_alive "$sid" "$lp" || continue      # dead -> phantom, skip
+    if [ "$pstate" -eq 0 ]; then
+      # A probe saying UP outranks idleness: an hour of session silence is
+      # normal while the user hand-tests on a device.
+      printf '%s\n%s\n%s\n%s\nhard\n' "$sid" "$dir" "$br" "$since"
+    elif [ $(( now - updated )) -ge "$WB_HOLD_IDLE" ]; then
+      printf '%s\n%s\n%s\n%s\nsoft\n' "$sid" "$dir" "$br" "$since"
+    else
+      printf '%s\n%s\n%s\n%s\nhard\n' "$sid" "$dir" "$br" "$since"
+    fi
+    return 0
+  done <<< "$(jq -r --arg r "$r" --arg self "$self" '
+      def clean: (. // "") | tostring | gsub("[\n\t\r]"; " ");
+      .sessions | to_entries
+      | map(select(.key != $self and ((.value.holds // {})[$r] // 0) > 0))
+      | sort_by(.value.holds[$r])
+      | .[] | [ (.key|clean), (.value.dir|clean), (.value.branch|clean),
+                (.value.holds[$r]|tostring), (.value.updated|tostring) ]
+      | @tsv' <<< "$fresh" 2>/dev/null)"
+  return 0
+}
+
+# A live OTHER session whose priority window is still open, or nothing.
+# Prints 3 lines: sid, seconds waited, until.
+#
+# The window holds off sessions that never waited. A session that IS on the
+# waiting list is exempt outright — any waiter may take the resource, not only
+# the one whose window is longest. Keeping that rule here rather than in the
+# caller means a second caller cannot forget it.
+wb_reserved_by() {
+  local r="$1" self="$2" fresh lp now line sid since untl
+  [ "$WB_RESERVE" -gt 0 ] 2>/dev/null || return 0
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"; now="$(wb_now)"
+  if [ "$(jq -r --arg s "$self" --arg r "$r" \
+        '((.sessions[$s].waits // {}) | has($r))' <<< "$fresh" 2>/dev/null)" = "true" ]; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sid="$(cut -f1 <<< "$line")"; since="$(cut -f2 <<< "$line")"
+    untl="$(cut -f3 <<< "$line")"
+    [ $(( now - since )) -lt "$WB_WAIT_TTL" ] || continue   # stale wait
+    wb_session_alive "$sid" "$lp" || continue
+    printf '%s\n%s\n%s\n' "$sid" "$(( now - since ))" "$untl"
+    return 0
+  done <<< "$(jq -r --arg r "$r" --arg self "$self" --arg n "$(wb_now)" '
+      .sessions | to_entries
+      | map(select(.key != $self
+              and ((.value.waits // {})[$r].until // 0) > ($n|tonumber)))
+      | sort_by(.value.waits[$r].since)
+      | .[] | [ .key, (.value.waits[$r].since|tostring),
+                (.value.waits[$r].until|tostring) ] | @tsv' <<< "$fresh" 2>/dev/null)"
+  return 0
+}

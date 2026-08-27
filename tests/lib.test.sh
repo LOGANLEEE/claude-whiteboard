@@ -73,6 +73,15 @@ no  "procStart mismatch is dead (pid reuse)" wb_pid_alive "$$" "Mon Jan  1 00:00
 yes "empty procStart falls back to kill -0" wb_pid_alive "$$" ""
 no  "non-numeric pid is dead" wb_pid_alive "abc" ""
 
+# `ps` yielding nothing for a pid `kill -0` accepted is UNKNOWN, not dead. A
+# container or a locked-down sandbox can produce exactly that, and treating it
+# as dead would hand the resource away from a live holder. Stubbed, because a
+# pid that passes kill -0 while ps stays silent cannot be arranged on purpose.
+ps() { :; }
+yes "silent ps keeps the holder alive" wb_pid_alive "$$" "Mon Jan  1 00:00:00 2020"
+unset -f ps
+no  "and the real ps still detects reuse" wb_pid_alive "$$" "Mon Jan  1 00:00:00 2020"
+
 yes "session_alive: live session"   wb_session_alive LIVE   "$LP"
 no  "session_alive: gone session"   wb_session_alive GONE   "$LP"
 no  "session_alive: absent from registry" wb_session_alive NOSUCH "$LP"

@@ -279,6 +279,19 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Changelog
 
+### 0.4.1
+
+- **Fix: a probe no longer evicts a hold that is still booting.** A claim is recorded at
+  `PreToolUse`, *before* the command runs, so a stack that takes minutes to start
+  legitimately probes DOWN for that whole window. The probe-DOWN path treated such a hold
+  as a phantom and cleared it, letting a second session claim mid-boot — the exact
+  collision resource claims exist to prevent. Probe-driven eviction now applies only past
+  `CC_WHITEBOARD_PROBE_GRACE` (default 300s).
+- The defect was dormant in 0.4.0: every test ran with `probe: ""`, which yields
+  *unknown* and never evicts, so the branch only armed itself once a real probe was
+  configured. New env var `CC_WHITEBOARD_PROBE_GRACE`.
+- Tests: 195 assertions (lib 57, on-prompt 68, on-pretool 70).
+
 ### 0.4.0
 
 - **Exclusive resource claims.** Sessions now coordinate shared singletons — the

@@ -9,7 +9,7 @@
       "name": "claude-whiteboard",
       "source": "./",
       "description": "Shared whiteboard for parallel Claude Code sessions. Post the ticket you're on and get warned before doing double-work; claim shared singletons like the local stack or an Xcode build and have the conflicting command blocked before it corrupts someone's run. Zero steady-state token cost.",
-      "version": "0.4.0",
+      "version": "0.4.1",
       "author": {
         "name": "Logan Lee"
       }

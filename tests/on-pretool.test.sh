@@ -189,5 +189,57 @@ jq -n --arg u "$((NOW - 4000))" --arg t "$((NOW - 4000))" \
 runp_env "$UP" B "$R1" "docker compose up -d"
 eq "probe UP blocks even an idle holder" "2" "$(rc)"
 
+# --- 14. release drops the hold and opens the window ----------------------
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp B "$R1" "docker compose up -d" >/dev/null       # B becomes a waiter
+runp A "$R1" "docker compose down"  >/dev/null
+eq "release exits 0" "0" "$(rc)"
+eq "hold dropped" "false" "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
+eq "waiter window opened" "true" \
+   "$(jq --argjson n "$(date +%s)" \
+        '.sessions.B.waits["local-stack@repo-one"].until > $n' "$CC_WHITEBOARD_REGISTRY")"
+
+# --- 15. a stranger is held off during the window, a waiter is not --------
+runp C "$R1" "docker compose up -d" >/dev/null
+eq  "stranger blocked inside the window" "2" "$(rc)"
+has "block names who is in line" "waiting" "$(err)"
+runp B "$R1" "docker compose up -d" >/dev/null
+eq "the waiter itself may claim" "0" "$(rc)"
+eq "waiter now holds it" "true" "$(q '.sessions.B.holds | has("local-stack@repo-one")')"
+eq "wait entry cleared on claim" "false" \
+   "$(q '.sessions.B | (.waits // {}) | has("local-stack@repo-one")')"
+
+# --- 16. once the window elapses a stranger may claim --------------------
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$NOW" --arg s "$((NOW - 600))" --arg t "$((NOW - 60))" \
+  '{sessions:{B:{updated:($u|tonumber), started:($u|tonumber), holds:{},
+                 waits:{"local-stack@repo-one":{since:($s|tonumber), until:($t|tonumber)}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq "expired window does not block" "0" "$(rc)"
+
+# --- 17. a wait older than WAIT_TTL grants no reservation ----------------
+reset
+jq -n --arg u "$NOW" --arg s "$((NOW - 99999))" --arg t "$((NOW + 300))" \
+  '{sessions:{B:{updated:($u|tonumber), started:($u|tonumber), holds:{},
+                 waits:{"local-stack@repo-one":{since:($s|tonumber), until:($t|tonumber)}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq "stale wait grants no reservation" "0" "$(rc)"
+
+# --- 18. session end opens the window on waiters -------------------------
+# SessionEnd output reaches no session's context, so it cannot notify anyone.
+# Opening the window is what completes the handoff when a holder simply exits.
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp B "$R1" "docker compose up -d" >/dev/null
+jq -nc '{session_id:"A", reason:"exit"}' | bash "$ROOT/scripts/on-session-end.sh" >/dev/null 2>&1
+eq "ending session is gone" "false" "$(q '.sessions | has("A")')"
+eq "session end opened the waiter window" "true" \
+   "$(jq --argjson n "$(date +%s)" \
+        '.sessions.B.waits["local-stack@repo-one"].until > $n' "$CC_WHITEBOARD_REGISTRY")"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

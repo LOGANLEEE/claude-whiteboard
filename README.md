@@ -162,12 +162,26 @@ The shipped default is deliberately generic, because this plugin is public:
 
 ```json
 {
-  "local-stack": { "claim": "docker[- ]compose\\b.*\\bup\\b|\\bngrok\\b",
-                   "release": "docker[- ]compose\\b.*\\bdown\\b", "probe": "" },
-  "xcode":       { "claim": "\\bxcodebuild\\b|xcrun +simctl +(boot|install|launch)",
-                   "release": "xcrun +simctl +shutdown", "probe": "" }
+  "local-stack": { "claim": "(^|[;&|(])[[:space:]]*(docker[- ]compose\\b.*\\bup\\b|ngrok\\b)",
+                   "release": "(^|[;&|(])[[:space:]]*docker[- ]compose\\b.*\\bdown\\b", "probe": "" },
+  "xcode":       { "claim": "(^|[;&|(])[[:space:]]*(xcodebuild\\b|xcrun +simctl +(boot|install|launch))",
+                   "release": "(^|[;&|(])[[:space:]]*xcrun +simctl +shutdown", "probe": "" }
 }
 ```
+
+Every claim pattern is anchored to **command position** — start of line, or just
+after `;`, `&`, `|` or `(`. A bare `\bngrok\b` claimed on the mere appearance of
+the word: a `sed` writing the literal string `your-tunnel.ngrok-free.dev` into a
+config file took the local-stack hold with no stack running. Anchor your own
+patterns the same way. A claim blocks every other session, so a false positive is
+far more expensive than a missed one.
+
+`CC_WHITEBOARD_RESOURCES` **replaces** this map; it does not merge into it. So a
+fix to a shipped pattern never reaches a machine that sets the variable — anchor
+your own patterns yourself, including the branches that look guarded. In a real
+override, `\bjust\b[^|;&]*\bstack::up\b` was assumed safe because `[^|;&]*`
+keeps both halves inside one pipeline segment. It does not anchor anything:
+`grep -rn "just stack::up" docs/` still claimed the resource.
 
 Override the whole map to add your project's own recipes (`just stack::up`,
 `just db::migrate`) and a real `probe`. A command matching several resources is
@@ -278,6 +292,34 @@ claude --plugin-dir ./claude-whiteboard
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 
 ## Changelog
+
+### 0.4.2
+
+- **Fix: every marker-based slash command was a silent no-op.** `/use`, `/free`,
+  `/force`, `/claim` and `/release` asked the model to emit an `@wb-*` marker and
+  left the `UserPromptSubmit` hook to pick it up. The hook receives the text the
+  user typed — `/claude-whiteboard:free xcode` — not the expanded command body, so
+  the marker was never there to find. Each command reported success and changed
+  nothing; a session waited 30 minutes behind a hold its owner believed it had
+  released. The commands now call the new `scripts/board.sh` directly, using
+  `CLAUDE_CODE_SESSION_ID`, which a Bash tool call does carry and which is the same
+  id the hooks get on stdin. Hand-typed `@wb-*` markers keep working unchanged.
+- **Fix: scripts run outside a hook read a different, empty registry.**
+  `CLAUDE_PLUGIN_DATA` is set for hooks only, so `scripts/status.sh` fell back to
+  `~/.claude` and printed `No active sessions` against a live board of eight.
+  That made `/free`'s own verification step blind by construction. `lib.sh` now
+  finds the plugin data directory by name when the variable is absent, and
+  `status.sh` exits non-zero saying so rather than reporting a missing file as an
+  empty board.
+- **Fix: claim patterns are anchored to command position.** `\bngrok\b` matched a
+  `sed` that merely wrote `your-tunnel.ngrok-free.dev` into a config file, taking
+  the local-stack hold with nothing running and queueing a second session behind
+  it. `\bxcodebuild\b` had the same shape. Both now require the tool to be in
+  command position. No shippable generic probe exists for a public plugin — set
+  one in `CC_WHITEBOARD_RESOURCES` (e.g. `lsof -nP -iTCP:7925 -sTCP:LISTEN`); the
+  `CC_WHITEBOARD_PROBE_GRACE` window added in 0.4.1 already keeps it from evicting
+  a stack that is still booting.
+- Tests: 223 assertions (lib 65, on-prompt 68, on-pretool 70, board 20).
 
 ### 0.4.1
 

@@ -11,10 +11,9 @@ a GUI Xcode build, which executes no command this plugin can see. Resources that
 *are* driven by a command (`docker compose up`, `ngrok`, `xcodebuild`) are claimed
 automatically and need no `/use`.
 
-Emit exactly the following marker line (and nothing else) so the whiteboard
-UserPromptSubmit hook records the claim:
-
-@wb-use: $ARGUMENTS
+```bash
+"${CLAUDE_PLUGIN_ROOT}"/scripts/board.sh use "$ARGUMENTS"
+```
 
 Then tell the user in one line that "$ARGUMENTS" is claimed **for this repo**
 (claims are scoped per repo, so another project's resource of the same name is

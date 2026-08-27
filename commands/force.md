@@ -22,6 +22,10 @@ board will not warn that session until its next prompt.
 "${CLAUDE_PLUGIN_ROOT}"/scripts/status.sh
 ```
 
-On confirmation, emit exactly this marker line and nothing else:
+On confirmation, and only then, run:
 
-@wb-force: $ARGUMENTS
+```bash
+"${CLAUDE_PLUGIN_ROOT}"/scripts/board.sh force "$ARGUMENTS"
+```
+
+Report that script's output to the user verbatim in one line.

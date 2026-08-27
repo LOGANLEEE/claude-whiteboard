@@ -21,6 +21,13 @@
 #   @wb-ignore           -> this prompt is not work: no sniffing, no writes at all
 #   @wb-claim: <label>   -> set this session's label
 #   @wb-release          -> clear this session's label   (wins if both appear)
+#   @wb-use: <resource>  -> claim a shared resource
+#   @wb-free: <resource> -> release it and open the waiters' priority window
+#   @wb-force: <resource>-> take it from whoever holds it
+#
+# These fire only on text the USER typed. A slash command body is expanded into
+# a message this hook never sees, so /claude-whiteboard:use and friends call
+# scripts/board.sh directly instead of routing through a marker.
 #
 # Input: JSON on stdin (session_id, prompt, cwd, ...). Output: stdout -> context.
 
@@ -100,18 +107,15 @@ elif [ -n "$prompt_ticket" ]; then
 fi
 
 if [ -n "$release" ]; then
-  wb_update '.sessions[$sid].label = null' --arg sid "$sid" 2>/dev/null || true
+  wb_clear_label "$sid"
   label=""   # released: nothing to conflict-check
 elif [ -n "$label" ]; then
-  wb_update '.sessions[$sid].label = $label' \
-    --arg sid "$sid" --arg label "$label" 2>/dev/null || true
+  wb_set_label "$sid" "$label"
 fi
 
 # --- Resource markers ------------------------------------------------------
-# /claude-whiteboard:use, :free and :force emit these. Same marker-in-prompt
-# pattern as @wb-claim, for the reason recorded in the keyword-claim spec: a
-# script invoked from a command body never receives session_id, so only a hook
-# can write the right registry entry.
+# Hand-typed only. The slash commands used to emit these and it never worked:
+# see the header above and scripts/board.sh.
 marker_arg() {  # marker_arg <marker-name>
   grep -oE "@wb-$1:.*" <<< "$prompt" | head -n1 \
     | sed -E "s/^@wb-$1:[[:space:]]*//; s/[[:space:]]+\$//" || true
@@ -129,18 +133,7 @@ if [ -n "$r_free" ]; then
   wb_open_window "$res_f" "$WB_RESERVE"
 fi
 if [ -n "$r_force" ]; then
-  res_x="$(wb_resource_name "$r_force" "$cwd")"
-  prev="$(jq -r --arg r "$res_x" --arg self "$sid" '
-      .sessions | to_entries
-      | map(select(.key != $self and ((.value.holds // {}) | has($r))))
-      | .[].key' <<< "$(wb_read_fresh)" 2>/dev/null)"
-  for p in $prev; do wb_unhold "$p" "$res_x"; done
-  wb_hold "$sid" "$res_x"
-  if [ -n "$prev" ]; then
-    echo "[claude-whiteboard] forced \"$res_x\" — taken from session(s): $(printf '%s' "$prev" | tr '\n' ' ' | sed 's/ *$//')."
-  else
-    echo "[claude-whiteboard] \"$res_x\" was already free; you hold it now."
-  fi
+  wb_force "$(wb_resource_name "$r_force" "$cwd")" "$sid"
 fi
 
 # No ticket evidence and no label this prompt -> nothing to CONFLICT-CHECK.

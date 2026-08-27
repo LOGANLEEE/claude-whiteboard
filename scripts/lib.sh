@@ -5,8 +5,27 @@
 # --- Config (all overridable via env) -------------------------------------
 
 # Registry file. Default: per-user, shared across ALL sessions & worktrees.
-# CLAUDE_PLUGIN_DATA persists across plugin updates; fall back to ~/.claude.
-WB_REGISTRY="${CC_WHITEBOARD_REGISTRY:-${CLAUDE_PLUGIN_DATA:-$HOME/.claude}/whiteboard/registry.json}"
+# CLAUDE_PLUGIN_DATA persists across plugin updates, but Claude Code sets it for
+# HOOKS only — a plain Bash tool call (`scripts/status.sh`, `scripts/board.sh`)
+# runs without it. Falling straight through to ~/.claude therefore split the
+# board in two: hooks wrote one registry and every hand-run script read another,
+# empty one, and `status.sh` reported "No active sessions" against a live board.
+# So when the variable is absent, find the plugin's own data directory by name
+# before giving up on ~/.claude.
+# Plain branches, not a $(...) helper: this file is sourced on every Bash tool
+# call in every session, and the hook path must not pay a fork to learn nothing.
+if [ -n "${CC_WHITEBOARD_REGISTRY:-}" ]; then
+  WB_REGISTRY="$CC_WHITEBOARD_REGISTRY"
+elif [ -n "${CLAUDE_PLUGIN_DATA:-}" ]; then
+  WB_REGISTRY="$CLAUDE_PLUGIN_DATA/whiteboard/registry.json"
+else
+  WB_REGISTRY="$HOME/.claude/whiteboard/registry.json"
+  for _wb_d in "$HOME"/.claude/plugins/data/*claude-whiteboard*; do
+    [ -f "$_wb_d/whiteboard/registry.json" ] || continue
+    WB_REGISTRY="$_wb_d/whiteboard/registry.json"; break
+  done
+  unset _wb_d
+fi
 
 # Regex used to sniff a ticket id from a prompt (grep -oE). Generic by default:
 # matches ETHEN-447, ETHENAPAYF-375, JIRA-12, ABC-9 ...
@@ -215,15 +234,24 @@ wb_session_alive() {
 #   claim   ERE -> running this takes the resource
 #   release ERE -> running this gives it back
 #   probe   shell command, exit 0 = the resource is really up ("" = no probe)
+#
+# Every pattern is anchored to COMMAND POSITION — start of the command line, or
+# just after a `;`, `&`, `|` or `(`. A bare word-boundary match claimed on the
+# mere APPEARANCE of the name: a sed writing the literal string
+# `your-tunnel.ngrok-free.dev` into a config file took the local-stack hold and
+# queued a second session behind it for half an hour with no stack running.
+# A claim is recorded BEFORE the command runs and blocks every other session, so
+# a false positive costs a peer its whole run, while a false negative costs only
+# the protection this plugin adds on top of having no plugin at all.
 WB_RESOURCES_DEFAULT='{
   "local-stack": {
-    "claim":   "docker[- ]compose\\b.*\\bup\\b|\\bngrok\\b",
-    "release": "docker[- ]compose\\b.*\\bdown\\b",
+    "claim":   "(^|[;&|(])[[:space:]]*(docker[- ]compose\\b.*\\bup\\b|ngrok\\b)",
+    "release": "(^|[;&|(])[[:space:]]*docker[- ]compose\\b.*\\bdown\\b",
     "probe":   ""
   },
   "xcode": {
-    "claim":   "\\bxcodebuild\\b|xcrun +simctl +(boot|install|launch)",
-    "release": "xcrun +simctl +shutdown",
+    "claim":   "(^|[;&|(])[[:space:]]*(xcodebuild\\b|xcrun +simctl +(boot|install|launch))",
+    "release": "(^|[;&|(])[[:space:]]*xcrun +simctl +shutdown",
     "probe":   ""
   }
 }'
@@ -324,6 +352,43 @@ wb_open_window() {
       then .value.waits[$r].until = (($n|tonumber) + ($s|tonumber))
       else . end)' \
     --arg r "$1" --arg n "$(wb_now)" --arg s "$secs" 2>/dev/null || true
+}
+
+# Ensure this session has a row and refresh its heartbeat. A write from a slash
+# command must not land on a session the board has never seen, and must not
+# leave a row without `updated` — status.sh does arithmetic on it.
+wb_touch() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {})
+      + {updated:($n|tonumber), started:((.sessions[$s].started) // ($n|tonumber))})' \
+    --arg s "$1" --arg n "$(wb_now)" 2>/dev/null || true
+}
+
+wb_set_label() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {}) + {label:$l})' \
+    --arg s "$1" --arg l "$2" 2>/dev/null || true
+}
+
+wb_clear_label() {
+  wb_update 'if .sessions[$s] then .sessions[$s].label = null else . end' \
+    --arg s "$1" 2>/dev/null || true
+}
+
+# Take <resource> from whoever holds it and give it to <self>. Prints one line
+# naming the previous holders, or saying it was already free. Shared by the
+# @wb-force marker and scripts/board.sh so the two entry points cannot drift.
+wb_force() {
+  local res="$1" self="$2" prev p
+  prev="$(jq -r --arg r "$res" --arg self "$self" '
+      .sessions | to_entries
+      | map(select(.key != $self and ((.value.holds // {}) | has($r))))
+      | .[].key' <<< "$(wb_read_fresh)" 2>/dev/null)"
+  for p in $prev; do wb_unhold "$p" "$res"; done
+  wb_hold "$self" "$res"
+  if [ -n "$prev" ]; then
+    echo "[claude-whiteboard] forced \"$res\" — taken from session(s): $(printf '%s' "$prev" | tr '\n' ' ' | sed 's/ *$//')."
+  else
+    echo "[claude-whiteboard] \"$res\" was already free; you hold it now."
+  fi
 }
 
 # Holder of <resource>, excluding <self>, or nothing when free.

@@ -115,6 +115,36 @@ eq "docker compose down releases"    "local-stack," "$(m 'docker compose down' r
 eq "docker compose down does not claim" ""          "$(m 'docker compose down')"
 eq "ls claims nothing"                    ""             "$(m 'ls -la')"
 
+# A resource name that merely APPEARS in a command must not take the hold. The
+# claim fires before the command runs and blocks every other session, so a
+# false positive costs a peer its whole run; a false negative costs only the
+# protection this plugin adds on top of no plugin at all.
+eq "an ngrok hostname inside a string does not claim" "" \
+   "$(m 'sed -i "" "s|HOST|your-tunnel.ngrok-free.dev|" ios/Local.xcconfig')"
+eq "ngrok start still claims"  "local-stack," "$(m 'ngrok start --all')"
+eq "ngrok behind flags still claims" "local-stack," \
+   "$(m 'ngrok --config /tmp/n.yml http 8080')"
+eq "grepping for xcodebuild does not claim" "" "$(m 'grep -rn xcodebuild docs/')"
+eq "a path containing xcodebuild does not claim" "" "$(m 'cat logs/xcodebuild.log')"
+eq "xcodebuild after && still claims" "xcode," "$(m 'cd app && xcodebuild -scheme App')"
+
+# --- registry location without CLAUDE_PLUGIN_DATA ---------------------------
+# Hooks run with CLAUDE_PLUGIN_DATA set; a plain Bash tool call does not. If the
+# fallback is ~/.claude the two disagree and every script run by hand reads an
+# empty registry while the live board is elsewhere.
+FAKEHOME="$WORK/home"
+DATADIR="$FAKEHOME/.claude/plugins/data/claude-whiteboard-claude-whiteboard/whiteboard"
+mkdir -p "$DATADIR"
+printf '{"sessions":{}}' > "$DATADIR/registry.json"
+eq "registry resolves to the plugin data dir when the env var is absent" \
+   "$DATADIR/registry.json" \
+   "$(env -u CC_WHITEBOARD_REGISTRY -u CLAUDE_PLUGIN_DATA HOME="$FAKEHOME" \
+        bash -c 'source "'"$ROOT"'/scripts/lib.sh"; printf "%s" "$WB_REGISTRY"')"
+eq "an explicit CLAUDE_PLUGIN_DATA still wins" \
+   "$WORK/explicit/whiteboard/registry.json" \
+   "$(env -u CC_WHITEBOARD_REGISTRY CLAUDE_PLUGIN_DATA="$WORK/explicit" HOME="$FAKEHOME" \
+        bash -c 'source "'"$ROOT"'/scripts/lib.sh"; printf "%s" "$WB_REGISTRY"')"
+
 out="$(m 'docker compose up -d && xcodebuild -scheme App')"
 case "$out" in
   *local-stack*) case "$out" in

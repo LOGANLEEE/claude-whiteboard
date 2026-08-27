@@ -10,6 +10,19 @@ if ! wb_have_jq; then
   exit 0
 fi
 
+# An absent registry is a wrong path, not an empty board. Reading it as "no
+# sessions" is how /free came to verify itself against a file nothing writes:
+# hooks run with CLAUDE_PLUGIN_DATA set and a Bash tool call does not, so the
+# two used to resolve different files and this script reported a live board of
+# eight sessions as empty. lib.sh now finds the plugin data dir by name, but say
+# so loudly if the file still is not there rather than inventing a verdict.
+if [ ! -f "$WB_REGISTRY" ]; then
+  echo "claude-whiteboard: no registry at $WB_REGISTRY" >&2
+  echo "Nothing has written to the board there. If sessions ARE running, this is" >&2
+  echo "the wrong path — point CC_WHITEBOARD_REGISTRY at the file the hooks use." >&2
+  exit 1
+fi
+
 echo "claude-whiteboard registry: $WB_REGISTRY"
 echo
 

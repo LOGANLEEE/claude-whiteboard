@@ -154,5 +154,40 @@ eq  "taker holds it now" "true" "$(q '.sessions.C.holds | has("local-stack@repo-
 eq  "former holder lost it" "false" \
     "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
 
+# --- probe (11-13) ---------------------------------------------------------
+UP='{"local-stack":{"claim":"docker[- ]compose\\b.*\\bup\\b","release":"","probe":"true"}}'
+DOWN='{"local-stack":{"claim":"docker[- ]compose\\b.*\\bup\\b","release":"","probe":"false"}}'
+runp_env() {  # runp_env <resources-json> <sid> <cwd> <command>
+  jq -nc --arg s "$2" --arg c "$3" --arg cmd "$4" \
+    '{session_id:$s, cwd:$c, tool_name:"Bash", tool_input:{command:$cmd}}' \
+    | CC_WHITEBOARD_RESOURCES="$1" bash "$HOOK" >/dev/null 2>"$ERRLOG"
+  printf '%s' "$?" > "$RCF"
+}
+
+# 11. up but nobody claims it: only a probe can see this, and it gives nobody to
+# ask — so warn and ALLOW rather than block on an unattributable signal.
+reset
+runp_env "$UP" A "$R1" "docker compose up -d"
+eq  "unattributed resource does not block" "0" "$(rc)"
+has "unattributed resource warns" "unclaimed" "$(err)"
+eq  "claim still recorded" "true" "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+
+# 12. probe DOWN means the registry's hold is a phantom regardless of liveness.
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp_env "$DOWN" B "$R1" "docker compose up -d"
+eq "probe DOWN means the hold is a phantom" "0" "$(rc)"
+
+# 13. probe UP outranks idleness — an hour of silence is normal while the user
+# hand-tests on a device, and taking the hold then would be exactly wrong.
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$((NOW - 4000))" --arg t "$((NOW - 4000))" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"repo-one",
+                 holds:{"local-stack@repo-one":($t|tonumber)}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp_env "$UP" B "$R1" "docker compose up -d"
+eq "probe UP blocks even an idle holder" "2" "$(rc)"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

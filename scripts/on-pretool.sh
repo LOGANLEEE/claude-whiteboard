@@ -136,6 +136,16 @@ You are now recorded as WAITING for it.
 "
   fi
 
+  # The resource is up, but nobody on the board claims it. Only a probe can see
+  # this: a non-Claude process, or a session that started before the plugin was
+  # installed. WARN, do not block — an unattributable signal gives nobody to
+  # ask, and blocking on it is exactly the noise that makes people stop trusting
+  # the warning.
+  if [ -z "$holder" ] && wb_probe "$bare"; then
+    notes="${notes}[claude-whiteboard] \"$res\" appears to be UP but is unclaimed on the board — another process, or a session older than this plugin. Check before you rely on it.
+"
+  fi
+
   # Free, but is someone else first in line?
   reserved="$(wb_reserved_by "$res" "$sid")"
   if [ -n "$reserved" ]; then

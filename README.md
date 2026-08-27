@@ -176,6 +176,13 @@ config file took the local-stack hold with no stack running. Anchor your own
 patterns the same way. A claim blocks every other session, so a false positive is
 far more expensive than a missed one.
 
+`CC_WHITEBOARD_RESOURCES` **replaces** this map; it does not merge into it. So a
+fix to a shipped pattern never reaches a machine that sets the variable — anchor
+your own patterns yourself, including the branches that look guarded. In a real
+override, `\bjust\b[^|;&]*\bstack::up\b` was assumed safe because `[^|;&]*`
+keeps both halves inside one pipeline segment. It does not anchor anything:
+`grep -rn "just stack::up" docs/` still claimed the resource.
+
 Override the whole map to add your project's own recipes (`just stack::up`,
 `just db::migrate`) and a real `probe`. A command matching several resources is
 **all-or-nothing**: if one is held, nothing is claimed, so a block never leaves a

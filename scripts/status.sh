@@ -36,3 +36,37 @@ fi
 
 printf 'SESSION\tTICKET\tSRC\tLABEL\tBRANCH\tPEER\tLAST SEEN\n'
 printf '%s\n' "$rows"
+
+echo
+
+# Shared resources. Held and waited-on rows come from the same session-centric
+# registry, so a session that ages out of the TTL takes its holds and waits with
+# it and cannot leave a ghost row here.
+resrows="$(wb_read_fresh | jq -r --argjson peers "$peers" --arg now "$(wb_now)" '
+  ($now|tonumber) as $t
+  | [ .sessions | to_entries[] as $s
+      | ($s.value.holds // {}) | to_entries[]
+      | {res: .key, who: $s.key, since: .value} ] as $held
+  | [ .sessions | to_entries[] as $s
+      | ($s.value.waits // {}) | to_entries[]
+      | {res: .key, who: $s.key, since: .value.since} ] as $waiting
+  | (($held + $waiting) | map(.res) | unique)
+  | map(. as $r
+      | ($held    | map(select(.res == $r)) | first) as $h
+      | ($waiting | map(select(.res == $r))
+         | map((($peers[.who] // {}).name // .who[0:8])
+               + "(" + ((($t - .since) / 60) | floor | tostring) + "m)")
+         | join(", ")) as $w
+      | $r
+        + "\t" + (if $h then ($h.who[0:8]) else "-" end)
+        + "\t" + (if $h then (($peers[$h.who] // {}).name // "-") else "-" end)
+        + "\t" + (if $h then (((($t - $h.since) / 60) | floor | tostring) + "m") else "-" end)
+        + "\t" + (if $w == "" then "-" else $w end))
+  | .[]' 2>/dev/null)"
+
+if [ -z "$resrows" ]; then
+  echo "No shared resources claimed."
+else
+  printf 'RESOURCE\tHOLDER\tPEER\tSINCE\tWAITING\n'
+  printf '%s\n' "$resrows"
+fi

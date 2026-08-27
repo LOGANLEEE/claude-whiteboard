@@ -1,14 +1,18 @@
 {
   "name": "claude-whiteboard",
   "description": "Coordination plugins for parallel Claude Code sessions.",
-  "owner": { "name": "Logan Lee" },
+  "owner": {
+    "name": "Logan Lee"
+  },
   "plugins": [
     {
       "name": "claude-whiteboard",
       "source": "./",
-      "description": "Shared whiteboard for parallel Claude Code sessions — post the ticket you're on, get warned before doing double-work. Zero steady-state token cost.",
-      "version": "0.3.0",
-      "author": { "name": "Logan Lee" }
+      "description": "Shared whiteboard for parallel Claude Code sessions. Post the ticket you're on and get warned before doing double-work; claim shared singletons like the local stack or an Xcode build and have the conflicting command blocked before it corrupts someone's run. Zero steady-state token cost.",
+      "version": "0.4.0",
+      "author": {
+        "name": "Logan Lee"
+      }
     }
   ]
 }

@@ -20,7 +20,8 @@ that owns it**, so the two can settle it between themselves.
 |------|--------------|
 | `SessionStart` | Registers this session and injects the list of *other* active sessions into context, each with the address you can message it on. |
 | `UserPromptSubmit` | Works out this session's current ticket (see [Ticket evidence](#ticket-evidence-mention--work)) plus any claimed **label**, records it, and — **only if another live session demonstrably owns that same ticket or label** — injects a conflict warning telling the agent to stop and check with you. Silent otherwise. |
-| `SessionEnd` | Removes this session (ticket and label) and prunes stale (crashed) entries past the TTL. |
+| `PreToolUse` (Bash) | Matches the command against the [resource map](#shared-resources-the-local-stack-an-xcode-build-a-tunnel). Claims a free resource silently; **blocks** the command when another live session holds it, and records this session as a waiter. Does nothing at all for a command that touches no resource. |
+| `SessionEnd` | Removes this session (ticket, label and holds) and prunes stale (crashed) entries past the TTL. Opens the priority window on anyone waiting for a resource it held. |
 
 ```
 session A  ──"work on ETHEN-447"──▶  whiteboard: A = ETHEN-447
@@ -124,6 +125,87 @@ Consequences worth knowing:
   prints is *not* stored in the session registry, so the board cannot offer it.
 - **A mention-only note gets no address**, deliberately — it stays one line.
 
+### Shared resources: the local stack, an Xcode build, a tunnel
+
+A ticket conflict means two sessions may do the same work twice — wasteful, but
+recoverable. A **resource** conflict is different in kind: the second session
+does not duplicate the first, it *corrupts* it. Bringing up a second local stack
+rewrites the database and the shared config rows the first session is running
+against, and the victim then debugs a failure that looks like a bug in its own
+feature.
+
+So resources are not warned about at prompt time. They are **blocked at the
+moment the command runs**, by a `PreToolUse` hook on `Bash`:
+
+```
+$ docker compose up -d
+
+BLOCKED: "local-stack@wallet-monorepo" is held by session fe649d0f
+  dir: backend   branch: fix/pay-106   since: 12m ago
+
+You are now recorded as WAITING for it.
+Ask the holder directly:
+  SendMessage({to: "931-deposit", message: "I need local-stack. When can I take it?"})
+```
+
+**Names are scoped per repo** — `local-stack@wallet-monorepo`. The registry is one
+file shared by every repo on the machine, so an unscoped name would let one
+project block an unrelated one. The repo key comes from
+`git rev-parse --git-common-dir`, **not** `--show-toplevel`: a linked worktree's
+toplevel is its own directory, and worktrees of one repo are exactly the
+collision domain, since they share the database and the ports.
+
+#### Which commands claim what
+
+`CC_WHITEBOARD_RESOURCES` is a JSON map of resource → `{claim, release, probe}`.
+The shipped default is deliberately generic, because this plugin is public:
+
+```json
+{
+  "local-stack": { "claim": "docker[- ]compose\\b.*\\bup\\b|\\bngrok\\b",
+                   "release": "docker[- ]compose\\b.*\\bdown\\b", "probe": "" },
+  "xcode":       { "claim": "\\bxcodebuild\\b|xcrun +simctl +(boot|install|launch)",
+                   "release": "xcrun +simctl +shutdown", "probe": "" }
+}
+```
+
+Override the whole map to add your project's own recipes (`just stack::up`,
+`just db::migrate`) and a real `probe`. A command matching several resources is
+**all-or-nothing**: if one is held, nothing is claimed, so a block never leaves a
+phantom on a resource that was not the reason for it.
+
+#### Waiting, and getting it back
+
+A blocked session is recorded as a waiter and handed the holder's `SendMessage`
+address. The holder asks *you*, because only you know whether its run is still
+needed — no session ever releases another session's resource.
+
+When the holder releases (`/claude-whiteboard:free`, a matching release command,
+or simply ending its session), every waiter gets a short **priority window**:
+during it, a session that never waited is held off, while **any** waiter may
+claim — not only the one who waited longest. That is deliberately a timestamp
+rather than an auto-grant. Handing ownership to an idle waiter would create the
+very phantom this feature exists to prevent.
+
+#### A hold nobody is using
+
+Three layers, all evaluated when a hook reads the registry. No daemon, no timers.
+
+| Layer | What it catches |
+|-------|-----------------|
+| **PID liveness** | The holder crashed. Its `pid` / `procStart` come from Claude Code's own `~/.claude/sessions/<pid>.json`, so a dead holder is reclaimed on the next check instead of waiting out the TTL. |
+| **Probe** (optional, per resource) | The holder is alive but tore the stack down. A probe exiting 0 means really up; it also outranks idleness, because an hour of silence is normal while you hand-test on a device. |
+| **Idle soft-expiry** | No probe and the holder has not prompted for `CC_WHITEBOARD_HOLD_IDLE`. Anyone may then take it with a one-line notice, no `/force` needed. |
+
+**Liveness is three-valued.** If the session registry is missing or unreadable,
+liveness is *unknown*, never *dead* — otherwise every holder would read as dead
+on such a machine, every hold would be reclaimed, and the lock would silently
+stop working while still reporting success.
+
+A probe that says a resource is up while **nobody** claims it produces a warning,
+not a block: that is a non-Claude process or a session older than this plugin,
+and there is nobody to ask.
+
 ### Token cost
 
 Effectively **zero in steady state**. Hooks are shell scripts (no model tokens to
@@ -157,12 +239,20 @@ claude --plugin-dir ./claude-whiteboard
 | `CC_WHITEBOARD_TICKET_RE` | `[A-Z][A-Z0-9]+-[0-9]+` | Regex used to detect a ticket id, both in a prompt and (case-insensitively) in the worktree dir / branch name. Matches `ETHEN-447`, `JIRA-12`, etc. Tighten it if your naming produces false hits — e.g. a directory called `portfolio-2024` reads as ticket `PORTFOLIO-2024`. |
 | `CC_WHITEBOARD_SESSIONS_DIR` | `~/.claude/sessions` | Where Claude Code keeps its own per-session JSON files. Read-only — the plugin joins against it to learn each peer's `SendMessage` name. Point it elsewhere (or at an empty directory) to turn the address lookup off. |
 | `CC_WHITEBOARD_TTL` | `14400` (4h) | Entries older than this are treated as stale and pruned (crash safety). |
+| `CC_WHITEBOARD_RESOURCES` | generic map (see [Shared resources](#shared-resources-the-local-stack-an-xcode-build-a-tunnel)) | resource -> `{claim, release, probe}`. Override the whole map to add project-specific commands. |
+| `CC_WHITEBOARD_HOLD_IDLE` | `3600` (1h) | Holder idle seconds before a hold with no probe goes soft and anyone may take it. |
+| `CC_WHITEBOARD_RESERVE` | `300` (5m) | Priority window given to waiters when a resource is released. `0` disables it. |
+| `CC_WHITEBOARD_WAIT_TTL` | `7200` (2h) | A wait older than this is ignored and grants no reservation. |
+| `CC_WHITEBOARD_PROBE_TIMEOUT` | `2` | Seconds before a probe is treated as `unknown` rather than `down`. |
 
 ## Commands
 
 - `/claude-whiteboard:status` — print the current board (active sessions, tickets, labels, branches, peer names, last-seen age).
 - `/claude-whiteboard:claim <label>` — claim a free-text label for ticketless work so other sessions are warned off it.
 - `/claude-whiteboard:release` — drop this session's claimed label.
+- `/claude-whiteboard:use <resource>` — manually claim a shared resource. Needed only for something no command can be matched against, notably a GUI Xcode build.
+- `/claude-whiteboard:free <resource>` — release it and give waiters a head start.
+- `/claude-whiteboard:force <resource>` — take it from a holder you have verified is not using it.
 
 ## Notes & limits
 
@@ -188,6 +278,27 @@ claude --plugin-dir ./claude-whiteboard
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 
 ## Changelog
+
+### 0.4.0
+
+- **Exclusive resource claims.** Sessions now coordinate shared singletons — the
+  local stack, an Xcode/device build, a tunnel — not just tickets and labels. A
+  command that would take a resource another live session holds is **blocked by a
+  new `PreToolUse` hook** rather than warned about a prompt too late.
+- Resource names are **repo-scoped** (`local-stack@<repo>`), keyed on
+  `git rev-parse --git-common-dir` so every worktree of a repo shares one key.
+- A blocked session is recorded as a **waiter** and handed the holder's
+  `SendMessage` address. On release, waiters get a short **priority window**; any
+  waiter may claim during it, not only the first. Ownership is never auto-granted.
+- **Phantom holds** are resolved at read time by three layers: PID liveness from
+  Claude Code's own session registry, an optional per-resource probe, and idle
+  soft-expiry. Liveness is three-valued — an unreadable session registry means
+  *unknown*, never *dead*, so the lock cannot silently invert.
+- New commands `/claude-whiteboard:use`, `:free`, `:force`; board rows gain
+  `uses:` and `/claude-whiteboard:status` gains a `RESOURCE` table.
+- Five new env vars (see Configuration).
+- Tests: **181 assertions** across three suites (lib 54, on-prompt 68,
+  on-pretool 59), up from 56 in one.
 
 ### 0.3.0
 

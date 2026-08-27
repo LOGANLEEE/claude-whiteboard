@@ -134,3 +134,317 @@ wb_ticket_from_names() {
   done
   return 1
 }
+
+# --- Resource claims -------------------------------------------------------
+
+# Repo key for scoping a resource name. Uses --git-common-dir, NOT
+# --show-toplevel: a linked worktree's toplevel is its OWN directory, so
+# --show-toplevel gives every worktree a different key and defeats the whole
+# point. --git-common-dir returns the MAIN repo's .git from inside a worktree,
+# which is the real collision domain (shared DB, shared ports).
+wb_repo_key() {
+  local d="${1:-$PWD}" g
+  [ -d "$d" ] || return 1
+  g="$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$g" ] || return 1
+  basename "$(dirname "$g")"
+}
+
+# "<bare>@<repo>", or bare when the directory is not a git repo. The registry is
+# shared by every repo on the machine, so an unscoped name would let one
+# project's local-stack block an unrelated project's.
+wb_resource_name() {
+  local repo
+  repo="$(wb_repo_key "${2:-$PWD}" 2>/dev/null || true)"
+  if [ -n "$repo" ]; then printf '%s@%s' "$1" "$repo"; else printf '%s' "$1"; fi
+}
+
+# {sessionId: {pid, procStart, updatedAt}} from Claude Code's own session
+# registry. Unlike wb_peer_names this does NOT filter on `name`: liveness does
+# not need an address, and filtering on one would report an unnamed session as
+# dead and let another session steal its hold.
+wb_live_pids() {
+  local out
+  set -- "$WB_SESSIONS_DIR"/*.json
+  [ -e "$1" ] || { printf '{}'; return 0; }
+  out="$(jq -s 'map(select((.sessionId // "") != "" and (.pid // 0) > 0))
+         | map({key: .sessionId,
+                value: {pid: .pid,
+                        procStart: (.procStart // ""),
+                        updatedAt: (.updatedAt // 0)}})
+         | from_entries' "$@" 2>/dev/null)" || out=""
+  case "$out" in '{'*) printf '%s' "$out" ;; *) printf '{}' ;; esac
+}
+
+# Can we see liveness at all? An empty or absent session registry means the
+# INSTRUMENT is blind, not that every session is dead. Without this guard the
+# feature inverts on such a machine: every holder reads dead, every hold is
+# reclaimed, and locking silently stops working while reporting success.
+wb_liveness_known() { [ "$(wb_live_pids)" != "{}" ]; }
+
+# Is <pid> the same process <procStart> was recorded for?
+# Errs SAFE: anything undeterminable returns "alive", so an unclear signal
+# leaves a phantom (clearable with /force) instead of stealing a live hold.
+wb_pid_alive() {
+  local pid="$1" want="${2:-}" got
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -n "$want" ] || return 0
+  # procStart is stored in UTC; a bare `ps -o lstart=` prints LOCAL time, so on
+  # a +04 machine the two differ by four hours and a naive compare always fails.
+  got="$(TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+  [ -n "$got" ] || return 0
+  [ "$got" = "$want" ]
+}
+
+# Exit 0 when the session is alive OR liveness is unknown; 1 only for a
+# positively dead session.
+wb_session_alive() {
+  local sid="$1" lp="${2:-}" pid ps
+  [ -n "$lp" ] || lp="$(wb_live_pids)"
+  [ "$lp" != "{}" ] || return 0          # blind instrument -> not dead
+  pid="$(jq -r --arg s "$sid" '.[$s].pid // ""' <<< "$lp" 2>/dev/null)"
+  ps="$(jq -r --arg s "$sid" '.[$s].procStart // ""' <<< "$lp" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  wb_pid_alive "$pid" "$ps"
+}
+
+# Resource pattern map. Shipped defaults stay GENERIC: this plugin is public, so
+# project-specific recipes (just stack::up, just db::migrate) belong in a user's
+# CC_WHITEBOARD_RESOURCES override, not here.
+#   claim   ERE -> running this takes the resource
+#   release ERE -> running this gives it back
+#   probe   shell command, exit 0 = the resource is really up ("" = no probe)
+WB_RESOURCES_DEFAULT='{
+  "local-stack": {
+    "claim":   "docker[- ]compose\\b.*\\bup\\b|\\bngrok\\b",
+    "release": "docker[- ]compose\\b.*\\bdown\\b",
+    "probe":   ""
+  },
+  "xcode": {
+    "claim":   "\\bxcodebuild\\b|xcrun +simctl +(boot|install|launch)",
+    "release": "xcrun +simctl +shutdown",
+    "probe":   ""
+  }
+}'
+WB_HOLD_IDLE="${CC_WHITEBOARD_HOLD_IDLE:-3600}"
+WB_RESERVE="${CC_WHITEBOARD_RESERVE:-300}"
+WB_WAIT_TTL="${CC_WHITEBOARD_WAIT_TTL:-7200}"
+WB_PROBE_TIMEOUT="${CC_WHITEBOARD_PROBE_TIMEOUT:-2}"
+
+wb_resources() { printf '%s' "${CC_WHITEBOARD_RESOURCES:-$WB_RESOURCES_DEFAULT}"; }
+
+# Bare resource names whose <action> pattern matches <command>, one per line.
+# One command can match several resources; the caller must treat that as an
+# all-or-nothing set, never as independent claims.
+#
+# One jq call emits every (name, pattern) pair, name and pattern on alternating
+# lines. Reading the map key-by-key cost 1 + N spawns instead of 1, and this runs
+# twice on every Bash tool call in every session — ~7 ms per jq process, paid
+# thousands of times a day.
+#
+# NOT @tsv, and not any other jq escaping format: @tsv doubles backslashes, so
+# `\b` arrives as a literal backslash-then-b and every word-boundary pattern
+# silently stops matching. Verified at byte level (`\ b` -> `\ \ b`), which took
+# 26 assertions red to notice. Plain `jq -r` emits the string as-is; a pattern
+# containing a newline would break the pairing, but a newline is meaningless in
+# an ERE and `grep -E` could not use one anyway.
+wb_match_resources() {
+  local cmd="$1" action="${2:-claim}" name re
+  while IFS= read -r name && IFS= read -r re; do
+    [ -n "$name" ] && [ -n "$re" ] || continue
+    # Here-string, not printf|grep: grep -q exits at the first match and SIGPIPEs
+    # the writer, which under pipefail turns a MATCH into a failure on long input.
+    if grep -qE "$re" <<< "$cmd" 2>/dev/null; then printf '%s\n' "$name"; fi
+  done <<< "$(wb_resources | jq -r --arg a "$action" '
+      to_entries[] | select((.value[$a] // "") != "") | .key, .value[$a]' 2>/dev/null)"
+  return 0
+}
+
+# 0 = up, 1 = down, 2 = unknown. Unknown must never release a hold: a probe we
+# could not run is silence from a blind instrument, not evidence of absence.
+wb_probe() {
+  local cmd rc
+  cmd="$(wb_resources | jq -r --arg n "$1" '.[$n].probe // ""' 2>/dev/null)"
+  [ -n "$cmd" ] || return 2
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$WB_PROBE_TIMEOUT" sh -c "$cmd" >/dev/null 2>&1
+  else
+    sh -c "$cmd" >/dev/null 2>&1
+  fi
+  rc=$?
+  case "$rc" in
+    0)   return 0 ;;
+    127) return 2 ;;   # command not found -> we learned nothing
+    124) return 2 ;;   # timeout(1) killed it -> we learned nothing
+    *)   return 1 ;;
+  esac
+}
+
+# Claim. Idempotent: re-running the same command must NOT refresh `since`, or an
+# idle holder could hold a resource forever by repeating its own command.
+wb_hold() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {})
+      + {holds: ((.sessions[$s].holds // {})
+                 | if has($r) then . else . + {($r): ($n|tonumber)} end)})' \
+    --arg s "$1" --arg r "$2" --arg n "$(wb_now)" 2>/dev/null || true
+}
+
+wb_unhold() {
+  wb_update 'if .sessions[$s] then .sessions[$s].holds |= (. // {} | del(.[$r])) else . end' \
+    --arg s "$1" --arg r "$2" 2>/dev/null || true
+}
+
+wb_add_wait() {
+  wb_update '.sessions[$s] = ((.sessions[$s] // {})
+      + {waits: ((.sessions[$s].waits // {})
+                 | if has($r) then . else . + {($r): {since:($n|tonumber), until:0}} end)})' \
+    --arg s "$1" --arg r "$2" --arg n "$(wb_now)" 2>/dev/null || true
+}
+
+wb_drop_wait() {
+  wb_update 'if .sessions[$s] then .sessions[$s].waits |= (. // {} | del(.[$r])) else . end' \
+    --arg s "$1" --arg r "$2" 2>/dev/null || true
+}
+
+# Give every current waiter a head start over sessions that never waited. This
+# is the whole of "auto-grant": a timestamp, not a state machine. Nobody is
+# assigned ownership, so nobody ends up holding what they no longer want.
+wb_open_window() {
+  local secs="${2:-$WB_RESERVE}"
+  [ "$secs" -gt 0 ] 2>/dev/null || return 0
+  wb_update '.sessions |= with_entries(
+      if (.value.waits // {}) | has($r)
+      then .value.waits[$r].until = (($n|tonumber) + ($s|tonumber))
+      else . end)' \
+    --arg r "$1" --arg n "$(wb_now)" --arg s "$secs" 2>/dev/null || true
+}
+
+# Holder of <resource>, excluding <self>, or nothing when free.
+# Prints 5 lines: sid, dir, branch, since, state(hard|soft). One field per line
+# because "|" is legal in a branch name and TAB is IFS whitespace, either of
+# which would shift the fields on a single delimited line.
+wb_holder_of() {
+  local r="$1" self="$2" bare="${3:-}" fresh lp now line
+  local sid dir br since updated pstate
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"; now="$(wb_now)"
+
+  pstate=2
+  if [ -n "$bare" ]; then wb_probe "$bare"; pstate=$?; fi
+  [ "$pstate" -eq 1 ] && return 0     # probe says DOWN -> nobody holds it
+
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sid="$(cut -f1 <<< "$line")";   dir="$(cut -f2 <<< "$line")"
+    br="$(cut -f3 <<< "$line")";    since="$(cut -f4 <<< "$line")"
+    updated="$(cut -f5 <<< "$line")"
+    wb_session_alive "$sid" "$lp" || continue      # dead -> phantom, skip
+    if [ "$pstate" -eq 0 ]; then
+      # A probe saying UP outranks idleness: an hour of session silence is
+      # normal while the user hand-tests on a device.
+      printf '%s\n%s\n%s\n%s\nhard\n' "$sid" "$dir" "$br" "$since"
+    elif [ $(( now - updated )) -ge "$WB_HOLD_IDLE" ]; then
+      printf '%s\n%s\n%s\n%s\nsoft\n' "$sid" "$dir" "$br" "$since"
+    else
+      printf '%s\n%s\n%s\n%s\nhard\n' "$sid" "$dir" "$br" "$since"
+    fi
+    return 0
+  done <<< "$(jq -r --arg r "$r" --arg self "$self" '
+      def clean: (. // "") | tostring | gsub("[\n\t\r]"; " ");
+      .sessions | to_entries
+      | map(select(.key != $self and ((.value.holds // {})[$r] // 0) > 0))
+      | sort_by(.value.holds[$r])
+      | .[] | [ (.key|clean), (.value.dir|clean), (.value.branch|clean),
+                (.value.holds[$r]|tostring), (.value.updated|tostring) ]
+      | @tsv' <<< "$fresh" 2>/dev/null)"
+  return 0
+}
+
+# A live OTHER session whose priority window is still open, or nothing.
+# Prints 3 lines: sid, seconds waited, until.
+#
+# The window holds off sessions that never waited. A session that IS on the
+# waiting list is exempt outright — any waiter may take the resource, not only
+# the one whose window is longest. Keeping that rule here rather than in the
+# caller means a second caller cannot forget it.
+wb_reserved_by() {
+  local r="$1" self="$2" fresh lp now line sid since untl
+  [ "$WB_RESERVE" -gt 0 ] 2>/dev/null || return 0
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"; now="$(wb_now)"
+  if [ "$(jq -r --arg s "$self" --arg r "$r" \
+        '((.sessions[$s].waits // {}) | has($r))' <<< "$fresh" 2>/dev/null)" = "true" ]; then
+    return 0
+  fi
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    sid="$(cut -f1 <<< "$line")"; since="$(cut -f2 <<< "$line")"
+    untl="$(cut -f3 <<< "$line")"
+    [ $(( now - since )) -lt "$WB_WAIT_TTL" ] || continue   # stale wait
+    wb_session_alive "$sid" "$lp" || continue
+    printf '%s\n%s\n%s\n' "$sid" "$(( now - since ))" "$untl"
+    return 0
+  done <<< "$(jq -r --arg r "$r" --arg self "$self" --arg n "$(wb_now)" '
+      .sessions | to_entries
+      | map(select(.key != $self
+              and ((.value.waits // {})[$r].until // 0) > ($n|tonumber)))
+      | sort_by(.value.waits[$r].since)
+      | .[] | [ .key, (.value.waits[$r].since|tostring),
+                (.value.waits[$r].until|tostring) ] | @tsv' <<< "$fresh" 2>/dev/null)"
+  return 0
+}
+
+# Delete <resource> holds belonging to positively-dead sessions and print their
+# short ids, one per line. A dead session's hold is invisible to wb_holder_of
+# but still sits in the registry, where it would render on the board forever.
+#
+# The `wb_liveness_known` line below is an EARLY-OUT, not the safety guard.
+# Mutation-checked: removing it leaves every test green, because wb_session_alive
+# already returns "alive" when the session registry is unreadable. That guard —
+# `[ "$lp" != "{}" ]` in wb_session_alive — is the load-bearing one, and removing
+# IT turns "blind liveness still blocks" red. Keep this line to skip the jq and
+# the loop entirely when there is nothing to learn; do not mistake it for the
+# thing standing between "reclaim crashed sessions" and "silently disable the
+# lock on any machine with no session registry".
+wb_sweep_dead_holds() {
+  local r="$1" fresh lp sid swept=""
+  wb_liveness_known || return 0
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    wb_session_alive "$sid" "$lp" && continue
+    wb_unhold "$sid" "$r"
+    swept="${swept}${sid:0:8}
+"
+  done <<< "$(jq -r --arg r "$r" '
+      .sessions | to_entries
+      | map(select(((.value.holds // {})[$r] // 0) > 0))
+      | .[].key' <<< "$fresh" 2>/dev/null)"
+  [ -n "$swept" ] && printf '%s' "$swept"
+  return 0
+}
+
+# Take <resource> for <sid> ONLY if no OTHER session already holds it, then
+# report who actually got it. Returns 0 when this session holds it afterwards.
+#
+# The check and the write happen inside ONE jq expression under ONE lock. Doing
+# them as separate steps — wb_holder_of, then wb_hold — leaves a gap in which
+# two sessions both read "free" and both write: measured 5 of 12 concurrent
+# claimers winning the same resource, which is precisely the double-stack
+# corruption this feature exists to prevent.
+#
+# The re-read is not paranoia: `wb_update` reports nothing about whether its
+# condition fired, so the write's success is not the resulting state.
+wb_hold_exclusive() {
+  local sid="$1" res="$2"
+  wb_update '
+    if (.sessions | to_entries
+        | map(select(.key != $s and ((.value.holds // {}) | has($r))))
+        | length) == 0
+    then .sessions[$s] = ((.sessions[$s] // {})
+         + {holds: ((.sessions[$s].holds // {})
+                    | if has($r) then . else . + {($r): ($n|tonumber)} end)})
+    else . end' \
+    --arg s "$sid" --arg r "$res" --arg n "$(wb_now)" 2>/dev/null || true
+  [ "$(wb_read_fresh | jq -r --arg s "$sid" --arg r "$res" \
+        '((.sessions[$s].holds // {}) | has($r))' 2>/dev/null)" = "true" ]
+}

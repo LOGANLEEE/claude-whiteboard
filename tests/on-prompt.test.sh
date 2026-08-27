@@ -235,5 +235,70 @@ rm -f "$SESSDIR/torn.json"
 jq -e . "$CC_WHITEBOARD_REGISTRY" >/dev/null 2>&1 \
   && ok "registry is valid JSON" || bad "registry is valid JSON" "valid" "invalid"
 
+# --- resource notices ------------------------------------------------------
+# The pull backup for the SendMessage handoff: a holder that never reads its
+# inbox still learns someone is blocked on it, and a waiter learns the resource
+# came free without having to ask again.
+NOW="$(date +%s)"
+reset
+jq -n --arg u "$NOW" --arg s "$((NOW - 2400))" \
+  '{sessions:{
+     OWNER:{updated:($u|tonumber), started:($u|tonumber), dir:"backend",
+            holds:{"local-stack@repo":($u|tonumber)}},
+     L1:{updated:($u|tonumber), started:($u|tonumber),
+         waits:{"local-stack@repo":{since:($s|tonumber), until:0}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+
+out="$(run OWNER "$PLAIN" "carry on")"
+has "holder is told someone is waiting" 'waiting on "local-stack@repo"' "$out"
+has "holder is given the waiter address" 'label-peer' "$out"
+out="$(run OWNER "$PLAIN" "carry on again")"
+hasnt "the waiting notice does not repeat" 'waiting on' "$out"
+
+# A waiter whose resource became free.
+reset
+jq -n --arg u "$NOW" --arg s "$((NOW - 600))" --arg t "$((NOW + 240))" \
+  '{sessions:{L1:{updated:($u|tonumber), started:($u|tonumber),
+     waits:{"local-stack@repo":{since:($s|tonumber), until:($t|tonumber)}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+out="$(run L1 "$PLAIN" "any news")"
+has "waiter is told the resource is free" 'is now FREE' "$out"
+has "waiter is told about its head start" 'Reserved for you' "$out"
+out="$(run L1 "$PLAIN" "any news again")"
+hasnt "the free notice does not repeat" 'is now FREE' "$out"
+
+# A ticketless, labelless prompt must still reach the notices — that is why the
+# early `exit 0` became a flag.
+reset
+jq -n --arg u "$NOW" --arg s "$((NOW - 300))" \
+  '{sessions:{
+     OWNER:{updated:($u|tonumber), started:($u|tonumber),
+            holds:{"xcode@repo":($u|tonumber)}},
+     L1:{updated:($u|tonumber), started:($u|tonumber),
+         waits:{"xcode@repo":{since:($s|tonumber), until:0}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+out="$(run OWNER "$PLAIN" "no ticket and no label in this prompt at all")"
+has "notices fire without ticket or label" 'waiting on "xcode@repo"' "$out"
+
+# --- resource markers ------------------------------------------------------
+# Same marker-in-prompt pattern as @wb-claim, for the same reason recorded in
+# the keyword-claim spec: a script invoked from a command body never receives
+# session_id, so only a hook can write the right registry entry.
+reset
+run M1 "$GITWT" "@wb-use: xcode" >/dev/null
+eq "@wb-use records a hold" "true" \
+   "$(q '.sessions.M1.holds | keys | map(startswith("xcode@")) | any')"
+
+run M1 "$GITWT" "@wb-free: xcode" >/dev/null
+eq "@wb-free drops the hold" "0" "$(q '.sessions.M1.holds | length')"
+
+reset
+run M1 "$GITWT" "@wb-use: xcode" >/dev/null
+out="$(run M2 "$GITWT" "@wb-force: xcode")"
+eq  "@wb-force takes it" "true" \
+    "$(q '.sessions.M2.holds | keys | map(startswith("xcode@")) | any')"
+eq  "@wb-force strips the previous holder" "0" "$(q '.sessions.M1.holds | length')"
+has "@wb-force names whom it took from" "M1" "$out"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

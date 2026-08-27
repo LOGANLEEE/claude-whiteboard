@@ -1,0 +1,320 @@
+#!/usr/bin/env bash
+# Behavior tests for scripts/on-pretool.sh — resource claims.
+# Pure bash + jq: feeds PreToolUse JSON on stdin against a throwaway registry.
+# Run: bash tests/on-pretool.test.sh
+set -uo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+HOOK="$ROOT/scripts/on-pretool.sh"
+unset CC_WHITEBOARD_TICKET_RE CC_WHITEBOARD_TTL
+unset CC_WHITEBOARD_RESOURCES CC_WHITEBOARD_HOLD_IDLE CC_WHITEBOARD_RESERVE
+unset CC_WHITEBOARD_WAIT_TTL CC_WHITEBOARD_PROBE_TIMEOUT
+
+WORK="$(mktemp -d)"
+trap 'rm -rf "$WORK"' EXIT
+export CC_WHITEBOARD_REGISTRY="$WORK/registry.json"
+ERRLOG="$WORK/stderr"; RCF="$WORK/rc"
+
+SESSDIR="$WORK/sessions"; mkdir -p "$SESSDIR"
+export CC_WHITEBOARD_SESSIONS_DIR="$SESSDIR"
+MYSTART="$(TZ=UTC ps -o lstart= -p $$ 2>/dev/null | sed 's/^ *//; s/ *$//')"
+# Named by sid: wb_live_pids globs *.json and keys on the sessionId inside, so
+# the filename does not matter and several fixtures can share one live pid.
+sessfile() {  # sessfile <sid> <pid> <procStart> [name]
+  jq -n --arg s "$1" --argjson p "$2" --arg ps "$3" --arg n "${4:-}" \
+    '{sessionId:$s, pid:$p, procStart:$ps, kind:"interactive",
+      status:"idle", updatedAt:1}
+     + (if $n != "" then {name:$n} else {} end)' > "$SESSDIR/$1.json"
+}
+sessfile A $$     "$MYSTART"                 alpha
+sessfile B $$     "$MYSTART"                 bravo
+sessfile C $$     "$MYSTART"                 charlie
+sessfile D 999999 "Mon Jan  1 00:00:00 2020" delta   # crashed
+
+# Two separate repos, so the @repo suffix can be shown to isolate them.
+R1="$WORK/repo-one"; R2="$WORK/repo-two"
+for r in "$R1" "$R2"; do
+  mkdir -p "$r"; git init -q -b main "$r"
+  git -C "$r" -c user.email=t@t -c user.name=t commit -q --allow-empty -m init
+done
+
+pass=0; fail=0
+ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
+bad()  { fail=$((fail+1)); printf '  FAIL %s\n    want: %s\n    got:  %s\n' "$1" "$2" "$3"; }
+eq()   { [ "$2" = "$3" ] && ok "$1" || bad "$1" "$2" "$3"; }
+has()  { case "$3" in *"$2"*) ok "$1";; *) bad "$1" "contains: $2" "$3";; esac; }
+
+reset() { printf '{"sessions":{}}' > "$CC_WHITEBOARD_REGISTRY"; }
+runp() {  # runp <sid> <cwd> <command>
+  jq -nc --arg s "$1" --arg c "$2" --arg cmd "$3" \
+    '{session_id:$s, cwd:$c, tool_name:"Bash", tool_input:{command:$cmd}}' \
+    | bash "$HOOK" > "$WORK/out" 2>"$ERRLOG"
+  printf '%s' "${PIPESTATUS[1]}" > "$RCF"
+  cat "$WORK/out"
+}
+rc()  { cat "$RCF"; }
+err() { cat "$ERRLOG"; }
+q()   { jq -r "$1" "$CC_WHITEBOARD_REGISTRY"; }
+
+echo "registry: $CC_WHITEBOARD_REGISTRY"
+
+# --- 1. an unmatched command is a silent no-op -----------------------------
+reset
+runp A "$R1" "ls -la" >/dev/null
+eq "unmatched command exits 0"        "0" "$(rc)"
+eq "unmatched command is silent"      ""  "$(err)"
+eq "unmatched command writes no hold" "0" "$(q '[.sessions[]|(.holds//{})|length]|add // 0')"
+
+# --- 2. claiming a free resource ------------------------------------------
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+eq "claim exits 0"   "0" "$(rc)"
+eq "claim is silent" ""  "$(err)"
+eq "hold recorded, repo-scoped" "true" \
+   "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+# A hold written without a heartbeat is invisible: wb_read_fresh drops any entry
+# whose `updated` is missing, so the claim would silently block nobody. Asserted
+# directly so a regression fails on the cause, not on a downstream symptom.
+eq "claim also heartbeats the session" "true" \
+   "$(q '(.sessions.A.updated // 0) > 0')"
+eq "claim records dir for the block message" "repo-one" "$(q '.sessions.A.dir')"
+
+# --- 3. a second session is blocked and recorded as a waiter --------------
+runp B "$R1" "docker compose up -d" >/dev/null
+eq  "blocked with exit 2" "2" "$(rc)"
+has "block names the resource" 'local-stack@repo-one'     "$(err)"
+has "block names the holder"   'alpha'                    "$(err)"
+has "block offers SendMessage" 'SendMessage({to: "alpha"' "$(err)"
+eq  "waiter recorded" "true" "$(q '.sessions.B.waits | has("local-stack@repo-one")')"
+eq  "blocked session takes no hold" "false" \
+    "$(q '.sessions.B | (.holds // {}) | has("local-stack@repo-one")')"
+
+# --- 4. the same bare name in another repo does not collide ---------------
+runp C "$R2" "docker compose up -d" >/dev/null
+eq "other repo claims freely" "0" "$(rc)"
+eq "other repo hold is separate" "true" \
+   "$(q '.sessions.C.holds | has("local-stack@repo-two")')"
+
+# --- 5. re-claiming your own hold is idempotent ---------------------------
+SINCE="$(q '.sessions.A.holds["local-stack@repo-one"]')"
+sleep 1
+runp A "$R1" "docker compose up -d" >/dev/null
+eq "holder re-claim exits 0" "0" "$(rc)"
+eq "holder re-claim keeps since" "$SINCE" "$(q '.sessions.A.holds["local-stack@repo-one"]')"
+
+# --- 6. a compound command is all-or-nothing ------------------------------
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp B "$R1" "docker compose up -d && xcodebuild -scheme App" >/dev/null
+eq "compound blocked by one held resource" "2" "$(rc)"
+eq "no partial hold on the free resource" "false" \
+   "$(q '.sessions.B | (.holds // {}) | has("xcode@repo-one")')"
+
+# --- 7. a non-Bash tool is a no-op ----------------------------------------
+reset
+jq -nc --arg c "$R1" '{session_id:"A", cwd:$c, tool_name:"Read",
+                       tool_input:{file_path:"/x"}}' \
+  | bash "$HOOK" >/dev/null 2>"$ERRLOG"
+eq "non-Bash tool exits 0"   "0" "$?"
+eq "non-Bash tool is silent" ""  "$(err)"
+
+# --- 8. a crashed holder does not block ------------------------------------
+reset
+runp D "$R1" "docker compose up -d" >/dev/null   # D's pid 999999 is dead
+runp A "$R1" "docker compose up -d" >/dev/null
+eq  "dead holder does not block"   "0" "$(rc)"
+has "reclaim is announced" "reclaimed" "$(err)"
+eq  "reclaimer now holds it" "true" "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+eq  "dead session lost the hold" "false" \
+    "$(q '.sessions.D | (.holds // {}) | has("local-stack@repo-one")')"
+
+# --- 9. the instrument guard: no session registry -> never reclaim ---------
+# The whole lock inverts if an unreadable registry reads as "everyone is dead".
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+EMPTY="$WORK/no-sessions"; mkdir -p "$EMPTY"
+jq -nc --arg c "$R1" '{session_id:"B", cwd:$c, tool_name:"Bash",
+                       tool_input:{command:"docker compose up -d"}}' \
+  | CC_WHITEBOARD_SESSIONS_DIR="$EMPTY" bash "$HOOK" >/dev/null 2>"$ERRLOG"
+eq "blind liveness still blocks" "2" "$?"
+eq "hold survived a blind reclaim" "true" \
+   "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+
+# --- 10. a soft (idle, unprobed) hold can be taken by anyone ---------------
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$((NOW - 4000))" --arg t "$((NOW - 4000))" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"repo-one",
+                 holds:{"local-stack@repo-one":($t|tonumber)}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq  "soft hold is taken, not blocked" "0" "$(rc)"
+has "taking a soft hold is announced" "idle" "$(err)"
+eq  "taker holds it now" "true" "$(q '.sessions.C.holds | has("local-stack@repo-one")')"
+eq  "former holder lost it" "false" \
+    "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
+
+# --- probe (11-13) ---------------------------------------------------------
+UP='{"local-stack":{"claim":"docker[- ]compose\\b.*\\bup\\b","release":"","probe":"true"}}'
+DOWN='{"local-stack":{"claim":"docker[- ]compose\\b.*\\bup\\b","release":"","probe":"false"}}'
+runp_env() {  # runp_env <resources-json> <sid> <cwd> <command>
+  jq -nc --arg s "$2" --arg c "$3" --arg cmd "$4" \
+    '{session_id:$s, cwd:$c, tool_name:"Bash", tool_input:{command:$cmd}}' \
+    | CC_WHITEBOARD_RESOURCES="$1" bash "$HOOK" >/dev/null 2>"$ERRLOG"
+  printf '%s' "$?" > "$RCF"
+}
+
+# 11. up but nobody claims it: only a probe can see this, and it gives nobody to
+# ask — so warn and ALLOW rather than block on an unattributable signal.
+reset
+runp_env "$UP" A "$R1" "docker compose up -d"
+eq  "unattributed resource does not block" "0" "$(rc)"
+has "unattributed resource warns" "unclaimed" "$(err)"
+eq  "claim still recorded" "true" "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+
+# 12. probe DOWN means the registry's hold is a phantom regardless of liveness.
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp_env "$DOWN" B "$R1" "docker compose up -d"
+eq "probe DOWN means the hold is a phantom" "0" "$(rc)"
+
+# 13. probe UP outranks idleness — an hour of silence is normal while the user
+# hand-tests on a device, and taking the hold then would be exactly wrong.
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$((NOW - 4000))" --arg t "$((NOW - 4000))" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"repo-one",
+                 holds:{"local-stack@repo-one":($t|tonumber)}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp_env "$UP" B "$R1" "docker compose up -d"
+eq "probe UP blocks even an idle holder" "2" "$(rc)"
+
+# --- 14. release drops the hold and opens the window ----------------------
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp B "$R1" "docker compose up -d" >/dev/null       # B becomes a waiter
+runp A "$R1" "docker compose down"  >/dev/null
+eq "release exits 0" "0" "$(rc)"
+eq "hold dropped" "false" "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
+eq "waiter window opened" "true" \
+   "$(jq --argjson n "$(date +%s)" \
+        '.sessions.B.waits["local-stack@repo-one"].until > $n' "$CC_WHITEBOARD_REGISTRY")"
+
+# --- 15. a stranger is held off during the window, a waiter is not --------
+runp C "$R1" "docker compose up -d" >/dev/null
+eq  "stranger blocked inside the window" "2" "$(rc)"
+has "block names who is in line" "waiting" "$(err)"
+runp B "$R1" "docker compose up -d" >/dev/null
+eq "the waiter itself may claim" "0" "$(rc)"
+eq "waiter now holds it" "true" "$(q '.sessions.B.holds | has("local-stack@repo-one")')"
+eq "wait entry cleared on claim" "false" \
+   "$(q '.sessions.B | (.waits // {}) | has("local-stack@repo-one")')"
+
+# --- 16. once the window elapses a stranger may claim --------------------
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$NOW" --arg s "$((NOW - 600))" --arg t "$((NOW - 60))" \
+  '{sessions:{B:{updated:($u|tonumber), started:($u|tonumber), holds:{},
+                 waits:{"local-stack@repo-one":{since:($s|tonumber), until:($t|tonumber)}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq "expired window does not block" "0" "$(rc)"
+
+# --- 17. a wait older than WAIT_TTL grants no reservation ----------------
+reset
+jq -n --arg u "$NOW" --arg s "$((NOW - 99999))" --arg t "$((NOW + 300))" \
+  '{sessions:{B:{updated:($u|tonumber), started:($u|tonumber), holds:{},
+                 waits:{"local-stack@repo-one":{since:($s|tonumber), until:($t|tonumber)}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq "stale wait grants no reservation" "0" "$(rc)"
+
+# --- 18. session end opens the window on waiters -------------------------
+# SessionEnd output reaches no session's context, so it cannot notify anyone.
+# Opening the window is what completes the handoff when a holder simply exits.
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+runp B "$R1" "docker compose up -d" >/dev/null
+jq -nc '{session_id:"A", reason:"exit"}' | bash "$ROOT/scripts/on-session-end.sh" >/dev/null 2>&1
+eq "ending session is gone" "false" "$(q '.sessions | has("A")')"
+eq "session end opened the waiter window" "true" \
+   "$(jq --argjson n "$(date +%s)" \
+        '.sessions.B.waits["local-stack@repo-one"].until > $n' "$CC_WHITEBOARD_REGISTRY")"
+
+# --- 19. board rendering ---------------------------------------------------
+# Rendering runs on every SessionStart, so a crash here has a wide blast radius.
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$NOW" --arg h "$((NOW - 720))" --arg w "$((NOW - 180))" \
+  '{sessions:{
+     A:{updated:($u|tonumber), started:($u|tonumber), dir:"backend",
+        holds:{"local-stack@wallet":($h|tonumber)}},
+     B:{updated:($u|tonumber), started:($u|tonumber), dir:"wt-161",
+        waits:{"local-stack@wallet":{since:($w|tonumber), until:0}}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"; strc=$?
+eq  "status.sh exits 0"            "0" "$strc"
+has "status lists the resource"    "local-stack@wallet" "$st"
+has "status has a RESOURCE header" "RESOURCE"           "$st"
+has "status shows hold age"        "12m"                "$st"
+has "status names the waiter"      "alpha"              "$st"
+
+ss="$(jq -nc --arg c "$R1" '{session_id:"C", cwd:$c, source:"startup"}' \
+      | bash "$ROOT/scripts/on-session-start.sh" 2>&1)"; ssrc=$?
+eq  "on-session-start exits 0"  "0" "$ssrc"
+has "row carries uses:"         "uses: local-stack@wallet" "$ss"
+has "uses: is explained"        "blocked until they release it" "$ss"
+
+# A session that holds nothing must still render the section, saying so rather
+# than printing a bare header.
+reset
+jq -n --arg u "$(date +%s)" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"backend"}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"
+has "a board with no holds says so" "No shared resources claimed." "$st"
+
+# A wholly empty board exits at "No active sessions." before the resource
+# section — correct, since holds live inside session entries and there are none.
+reset
+st="$(bash "$ROOT/scripts/status.sh" 2>&1)"
+has "empty board short-circuits" "No active sessions." "$st"
+
+# --- 20. hostile / malformed stdin is a silent no-op ----------------------
+# This hook runs on EVERY Bash call once the plugin is installed, so anything
+# that is not a clean exit here is noise on the user's whole workflow.
+for bad in '' 'not json at all' '{}' '{"tool_name":"Bash"}' \
+           '{"tool_name":"Bash","tool_input":{"command":null}}' \
+           '{"tool_name":null,"tool_input":null}'; do
+  out="$(printf '%s' "$bad" | bash "$HOOK" 2>&1)"; brc=$?
+  if [ "$brc" = 0 ] && [ -z "$out" ]; then ok "malformed stdin is silent: ${bad:0:28}"
+  else bad "malformed stdin ${bad:0:24}" "rc=0, no output" "rc=$brc out=${out:0:50}"; fi
+done
+
+# --- 21. the command text is data, never something to execute -------------
+CANARY="$WORK/canary"
+for evil in 'echo hi; touch '"$CANARY" \
+            'docker compose up -d $(touch '"$CANARY"')' \
+            'docker compose up -d `touch '"$CANARY"'`'; do
+  runp E "$R1" "$evil" >/dev/null
+done
+eq "no command injection via command text" "false" "$([ -e "$CANARY" ] && echo true || echo false)"
+
+# --- 22. concurrent claims: exactly one winner ----------------------------
+# The core promise. wb_holder_of followed by wb_hold left a gap in which two
+# sessions both read "free" and both wrote: 5 of 12 concurrent claimers won.
+reset
+for i in $(seq 12); do
+  ( jq -nc --arg s "P$i" --arg c "$R1" \
+      '{session_id:$s, cwd:$c, tool_name:"Bash", tool_input:{command:"ngrok http 80"}}' \
+    | bash "$HOOK" >/dev/null 2>&1 ) &
+done
+wait
+eq "registry survives 12 concurrent claims" "true" \
+   "$(jq empty "$CC_WHITEBOARD_REGISTRY" 2>/dev/null && echo true || echo false)"
+eq "exactly one session holds it" "1" \
+   "$(q '[.sessions[] | (.holds // {}) | keys[] | select(. == "local-stack@repo-one")] | length')"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

@@ -382,3 +382,33 @@ wb_reserved_by() {
                 (.value.waits[$r].until|tostring) ] | @tsv' <<< "$fresh" 2>/dev/null)"
   return 0
 }
+
+# Delete <resource> holds belonging to positively-dead sessions and print their
+# short ids, one per line. A dead session's hold is invisible to wb_holder_of
+# but still sits in the registry, where it would render on the board forever.
+#
+# The `wb_liveness_known` line below is an EARLY-OUT, not the safety guard.
+# Mutation-checked: removing it leaves every test green, because wb_session_alive
+# already returns "alive" when the session registry is unreadable. That guard —
+# `[ "$lp" != "{}" ]` in wb_session_alive — is the load-bearing one, and removing
+# IT turns "blind liveness still blocks" red. Keep this line to skip the jq and
+# the loop entirely when there is nothing to learn; do not mistake it for the
+# thing standing between "reclaim crashed sessions" and "silently disable the
+# lock on any machine with no session registry".
+wb_sweep_dead_holds() {
+  local r="$1" fresh lp sid swept=""
+  wb_liveness_known || return 0
+  fresh="$(wb_read_fresh)"; lp="$(wb_live_pids)"
+  while IFS= read -r sid; do
+    [ -n "$sid" ] || continue
+    wb_session_alive "$sid" "$lp" && continue
+    wb_unhold "$sid" "$r"
+    swept="${swept}${sid:0:8}
+"
+  done <<< "$(jq -r --arg r "$r" '
+      .sessions | to_entries
+      | map(select(((.value.holds // {})[$r] // 0) > 0))
+      | .[].key' <<< "$fresh" 2>/dev/null)"
+  [ -n "$swept" ] && printf '%s' "$swept"
+  return 0
+}

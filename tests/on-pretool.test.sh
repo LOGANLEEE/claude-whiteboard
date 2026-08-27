@@ -118,5 +118,41 @@ jq -nc --arg c "$R1" '{session_id:"A", cwd:$c, tool_name:"Read",
 eq "non-Bash tool exits 0"   "0" "$?"
 eq "non-Bash tool is silent" ""  "$(err)"
 
+# --- 8. a crashed holder does not block ------------------------------------
+reset
+runp D "$R1" "docker compose up -d" >/dev/null   # D's pid 999999 is dead
+runp A "$R1" "docker compose up -d" >/dev/null
+eq  "dead holder does not block"   "0" "$(rc)"
+has "reclaim is announced" "reclaimed" "$(err)"
+eq  "reclaimer now holds it" "true" "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+eq  "dead session lost the hold" "false" \
+    "$(q '.sessions.D | (.holds // {}) | has("local-stack@repo-one")')"
+
+# --- 9. the instrument guard: no session registry -> never reclaim ---------
+# The whole lock inverts if an unreadable registry reads as "everyone is dead".
+reset
+runp A "$R1" "docker compose up -d" >/dev/null
+EMPTY="$WORK/no-sessions"; mkdir -p "$EMPTY"
+jq -nc --arg c "$R1" '{session_id:"B", cwd:$c, tool_name:"Bash",
+                       tool_input:{command:"docker compose up -d"}}' \
+  | CC_WHITEBOARD_SESSIONS_DIR="$EMPTY" bash "$HOOK" >/dev/null 2>"$ERRLOG"
+eq "blind liveness still blocks" "2" "$?"
+eq "hold survived a blind reclaim" "true" \
+   "$(q '.sessions.A.holds | has("local-stack@repo-one")')"
+
+# --- 10. a soft (idle, unprobed) hold can be taken by anyone ---------------
+reset
+NOW="$(date +%s)"
+jq -n --arg u "$((NOW - 4000))" --arg t "$((NOW - 4000))" \
+  '{sessions:{A:{updated:($u|tonumber), started:($u|tonumber), dir:"repo-one",
+                 holds:{"local-stack@repo-one":($t|tonumber)}}}}' \
+  > "$CC_WHITEBOARD_REGISTRY"
+runp C "$R1" "docker compose up -d" >/dev/null
+eq  "soft hold is taken, not blocked" "0" "$(rc)"
+has "taking a soft hold is announced" "idle" "$(err)"
+eq  "taker holds it now" "true" "$(q '.sessions.C.holds | has("local-stack@repo-one")')"
+eq  "former holder lost it" "false" \
+    "$(q '.sessions.A | (.holds // {}) | has("local-stack@repo-one")')"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

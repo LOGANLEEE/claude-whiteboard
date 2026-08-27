@@ -93,6 +93,14 @@ while IFS= read -r bare; do
   [ -n "$bare" ] || continue
   res="$(wb_resource_name "$bare" "$cwd")"
 
+  # Sweep first: a crashed holder must not block, and its stale row must not
+  # linger on the board. No-ops when liveness is unknown.
+  dead="$(wb_sweep_dead_holds "$res")"
+  if [ -n "$dead" ]; then
+    notes="${notes}[claude-whiteboard] reclaimed \"$res\" from session $(printf '%s' "$dead" | tr '\n' ' ' | sed 's/ *$//') — its process is gone.
+"
+  fi
+
   holder="$(wb_holder_of "$res" "$sid" "$bare")"
   if [ -n "$holder" ]; then
     h_sid=""; h_dir=""; h_br=""; h_since=""; h_state=""

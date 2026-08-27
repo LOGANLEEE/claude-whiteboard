@@ -134,3 +134,77 @@ wb_ticket_from_names() {
   done
   return 1
 }
+
+# --- Resource claims -------------------------------------------------------
+
+# Repo key for scoping a resource name. Uses --git-common-dir, NOT
+# --show-toplevel: a linked worktree's toplevel is its OWN directory, so
+# --show-toplevel gives every worktree a different key and defeats the whole
+# point. --git-common-dir returns the MAIN repo's .git from inside a worktree,
+# which is the real collision domain (shared DB, shared ports).
+wb_repo_key() {
+  local d="${1:-$PWD}" g
+  [ -d "$d" ] || return 1
+  g="$(git -C "$d" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [ -n "$g" ] || return 1
+  basename "$(dirname "$g")"
+}
+
+# "<bare>@<repo>", or bare when the directory is not a git repo. The registry is
+# shared by every repo on the machine, so an unscoped name would let one
+# project's local-stack block an unrelated project's.
+wb_resource_name() {
+  local repo
+  repo="$(wb_repo_key "${2:-$PWD}" 2>/dev/null || true)"
+  if [ -n "$repo" ]; then printf '%s@%s' "$1" "$repo"; else printf '%s' "$1"; fi
+}
+
+# {sessionId: {pid, procStart, updatedAt}} from Claude Code's own session
+# registry. Unlike wb_peer_names this does NOT filter on `name`: liveness does
+# not need an address, and filtering on one would report an unnamed session as
+# dead and let another session steal its hold.
+wb_live_pids() {
+  local out
+  set -- "$WB_SESSIONS_DIR"/*.json
+  [ -e "$1" ] || { printf '{}'; return 0; }
+  out="$(jq -s 'map(select((.sessionId // "") != "" and (.pid // 0) > 0))
+         | map({key: .sessionId,
+                value: {pid: .pid,
+                        procStart: (.procStart // ""),
+                        updatedAt: (.updatedAt // 0)}})
+         | from_entries' "$@" 2>/dev/null)" || out=""
+  case "$out" in '{'*) printf '%s' "$out" ;; *) printf '{}' ;; esac
+}
+
+# Can we see liveness at all? An empty or absent session registry means the
+# INSTRUMENT is blind, not that every session is dead. Without this guard the
+# feature inverts on such a machine: every holder reads dead, every hold is
+# reclaimed, and locking silently stops working while reporting success.
+wb_liveness_known() { [ "$(wb_live_pids)" != "{}" ]; }
+
+# Is <pid> the same process <procStart> was recorded for?
+# Errs SAFE: anything undeterminable returns "alive", so an unclear signal
+# leaves a phantom (clearable with /force) instead of stealing a live hold.
+wb_pid_alive() {
+  local pid="$1" want="${2:-}" got
+  case "$pid" in ''|*[!0-9]*) return 1 ;; esac
+  kill -0 "$pid" 2>/dev/null || return 1
+  [ -n "$want" ] || return 0
+  # procStart is stored in UTC; a bare `ps -o lstart=` prints LOCAL time, so on
+  # a +04 machine the two differ by four hours and a naive compare always fails.
+  got="$(TZ=UTC ps -o lstart= -p "$pid" 2>/dev/null | sed 's/^ *//; s/ *$//')"
+  [ -n "$got" ] || return 0
+  [ "$got" = "$want" ]
+}
+
+# Exit 0 when the session is alive OR liveness is unknown; 1 only for a
+# positively dead session.
+wb_session_alive() {
+  local sid="$1" lp="${2:-}" pid ps
+  [ -n "$lp" ] || lp="$(wb_live_pids)"
+  [ "$lp" != "{}" ] || return 0          # blind instrument -> not dead
+  pid="$(jq -r --arg s "$sid" '.[$s].pid // ""' <<< "$lp" 2>/dev/null)"
+  ps="$(jq -r --arg s "$sid" '.[$s].procStart // ""' <<< "$lp" 2>/dev/null)"
+  [ -n "$pid" ] || return 1
+  wb_pid_alive "$pid" "$ps"
+}

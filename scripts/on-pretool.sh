@@ -27,7 +27,11 @@ source "$DIR/lib.sh"
 input="$(cat)"
 wb_have_jq || exit 0
 
-tool="$(printf '%s' "$input" | jq -r '.tool_name // ""')"
+# This doubles as the malformed-stdin guard: jq exits non-zero on unparseable
+# input and we leave silently. Without it, `set -e` would abort on the first
+# field read and print a parse error — stderr noise from a hook that is supposed
+# to be invisible unless it blocks.
+tool="$(jq -r '.tool_name // ""' <<< "$input" 2>/dev/null)" || exit 0
 [ "$tool" = "Bash" ] || exit 0
 
 cmd="$(printf '%s' "$input" | jq -r '.tool_input.command // ""')"
@@ -99,6 +103,20 @@ while IFS= read -r bare; do
   if [ -n "$dead" ]; then
     notes="${notes}[claude-whiteboard] reclaimed \"$res\" from session $(printf '%s' "$dead" | tr '\n' ' ' | sed 's/ *$//') — its process is gone.
 "
+  fi
+
+  # A probe reporting DOWN makes every recorded hold on it a phantom, whoever
+  # wrote it. Clear them here: wb_holder_of already reports "free" in that case,
+  # while the atomic claim in pass 2 reads the raw registry — without this the
+  # two disagree and the claim is refused over a hold pass 1 already dismissed.
+  # Exit 2 is "unknown" and decides nothing, so only 1 counts.
+  prc=0; wb_probe "$bare" || prc=$?
+  if [ "$prc" -eq 1 ]; then
+    while IFS= read -r ph; do
+      [ -n "$ph" ] && wb_unhold "$ph" "$res"
+    done <<< "$(jq -r --arg r "$res" '.sessions | to_entries
+                 | map(select(((.value.holds // {})[$r] // 0) > 0)) | .[].key' \
+                <<< "$(wb_read_fresh)" 2>/dev/null)"
   fi
 
   holder="$(wb_holder_of "$res" "$sid" "$bare")"
@@ -173,13 +191,41 @@ if [ -n "$blocked" ]; then
   exit 2
 fi
 
-# Pass 2: nothing blocked, so take every claim.
+# Pass 2: nothing blocked, so take every claim — atomically. Pass 1 decided the
+# resource was free, but another session running its own claiming command in the
+# same moment reaches the same conclusion, and a plain wb_hold would let both
+# write. Measured before this was atomic: 5 of 12 concurrent claimers each
+# "won" the same resource, which is exactly the double-stack corruption the
+# whole feature exists to prevent.
+won=""
+lost=""
 while IFS= read -r bare; do
   [ -n "$bare" ] || continue
   res="$(wb_resource_name "$bare" "$cwd")"
-  wb_hold "$sid" "$res"
-  wb_drop_wait "$sid" "$res"
+  if wb_hold_exclusive "$sid" "$res"; then
+    won="${won}${res}
+"
+    wb_drop_wait "$sid" "$res"
+  else
+    lost="$res"
+    break
+  fi
 done <<< "$claims"
+
+if [ -n "$lost" ]; then
+  # Someone claimed it in the gap. Give back whatever we did win so a compound
+  # command stays all-or-nothing, then block like any other conflict.
+  while IFS= read -r r; do [ -n "$r" ] && wb_unhold "$sid" "$r"; done <<< "$won"
+  wb_add_wait "$sid" "$lost"
+  cat >&2 <<EOF
+BLOCKED: "$lost" was taken by another session a moment ago — you both ran a
+claiming command at the same time, and they got there first.
+
+You are now recorded as WAITING for it. Check who holds it with
+/claude-whiteboard:status, then ask that session before re-running.
+EOF
+  exit 2
+fi
 
 [ -n "$notes" ] && printf '%s' "$notes" >&2
 exit 0

@@ -281,5 +281,40 @@ reset
 st="$(bash "$ROOT/scripts/status.sh" 2>&1)"
 has "empty board short-circuits" "No active sessions." "$st"
 
+# --- 20. hostile / malformed stdin is a silent no-op ----------------------
+# This hook runs on EVERY Bash call once the plugin is installed, so anything
+# that is not a clean exit here is noise on the user's whole workflow.
+for bad in '' 'not json at all' '{}' '{"tool_name":"Bash"}' \
+           '{"tool_name":"Bash","tool_input":{"command":null}}' \
+           '{"tool_name":null,"tool_input":null}'; do
+  out="$(printf '%s' "$bad" | bash "$HOOK" 2>&1)"; brc=$?
+  if [ "$brc" = 0 ] && [ -z "$out" ]; then ok "malformed stdin is silent: ${bad:0:28}"
+  else bad "malformed stdin ${bad:0:24}" "rc=0, no output" "rc=$brc out=${out:0:50}"; fi
+done
+
+# --- 21. the command text is data, never something to execute -------------
+CANARY="$WORK/canary"
+for evil in 'echo hi; touch '"$CANARY" \
+            'docker compose up -d $(touch '"$CANARY"')' \
+            'docker compose up -d `touch '"$CANARY"'`'; do
+  runp E "$R1" "$evil" >/dev/null
+done
+eq "no command injection via command text" "false" "$([ -e "$CANARY" ] && echo true || echo false)"
+
+# --- 22. concurrent claims: exactly one winner ----------------------------
+# The core promise. wb_holder_of followed by wb_hold left a gap in which two
+# sessions both read "free" and both wrote: 5 of 12 concurrent claimers won.
+reset
+for i in $(seq 12); do
+  ( jq -nc --arg s "P$i" --arg c "$R1" \
+      '{session_id:$s, cwd:$c, tool_name:"Bash", tool_input:{command:"ngrok http 80"}}' \
+    | bash "$HOOK" >/dev/null 2>&1 ) &
+done
+wait
+eq "registry survives 12 concurrent claims" "true" \
+   "$(jq empty "$CC_WHITEBOARD_REGISTRY" 2>/dev/null && echo true || echo false)"
+eq "exactly one session holds it" "1" \
+   "$(q '[.sessions[] | (.holds // {}) | keys[] | select(. == "local-stack@repo-one")] | length')"
+
 printf '\n%d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

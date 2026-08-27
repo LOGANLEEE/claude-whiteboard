@@ -237,17 +237,27 @@ wb_resources() { printf '%s' "${CC_WHITEBOARD_RESOURCES:-$WB_RESOURCES_DEFAULT}"
 # Bare resource names whose <action> pattern matches <command>, one per line.
 # One command can match several resources; the caller must treat that as an
 # all-or-nothing set, never as independent claims.
+#
+# One jq call emits every (name, pattern) pair, name and pattern on alternating
+# lines. Reading the map key-by-key cost 1 + N spawns instead of 1, and this runs
+# twice on every Bash tool call in every session — ~7 ms per jq process, paid
+# thousands of times a day.
+#
+# NOT @tsv, and not any other jq escaping format: @tsv doubles backslashes, so
+# `\b` arrives as a literal backslash-then-b and every word-boundary pattern
+# silently stops matching. Verified at byte level (`\ b` -> `\ \ b`), which took
+# 26 assertions red to notice. Plain `jq -r` emits the string as-is; a pattern
+# containing a newline would break the pairing, but a newline is meaningless in
+# an ERE and `grep -E` could not use one anyway.
 wb_match_resources() {
-  local cmd="$1" action="${2:-claim}" name re res
-  res="$(wb_resources)"
-  while IFS= read -r name; do
-    [ -n "$name" ] || continue
-    re="$(jq -r --arg n "$name" --arg a "$action" '.[$n][$a] // ""' <<< "$res" 2>/dev/null)"
-    [ -n "$re" ] || continue
+  local cmd="$1" action="${2:-claim}" name re
+  while IFS= read -r name && IFS= read -r re; do
+    [ -n "$name" ] && [ -n "$re" ] || continue
     # Here-string, not printf|grep: grep -q exits at the first match and SIGPIPEs
     # the writer, which under pipefail turns a MATCH into a failure on long input.
     if grep -qE "$re" <<< "$cmd" 2>/dev/null; then printf '%s\n' "$name"; fi
-  done <<< "$(jq -r 'keys[]' <<< "$res" 2>/dev/null)"
+  done <<< "$(wb_resources | jq -r --arg a "$action" '
+      to_entries[] | select((.value[$a] // "") != "") | .key, .value[$a]' 2>/dev/null)"
   return 0
 }
 
@@ -411,4 +421,30 @@ wb_sweep_dead_holds() {
       | .[].key' <<< "$fresh" 2>/dev/null)"
   [ -n "$swept" ] && printf '%s' "$swept"
   return 0
+}
+
+# Take <resource> for <sid> ONLY if no OTHER session already holds it, then
+# report who actually got it. Returns 0 when this session holds it afterwards.
+#
+# The check and the write happen inside ONE jq expression under ONE lock. Doing
+# them as separate steps — wb_holder_of, then wb_hold — leaves a gap in which
+# two sessions both read "free" and both write: measured 5 of 12 concurrent
+# claimers winning the same resource, which is precisely the double-stack
+# corruption this feature exists to prevent.
+#
+# The re-read is not paranoia: `wb_update` reports nothing about whether its
+# condition fired, so the write's success is not the resulting state.
+wb_hold_exclusive() {
+  local sid="$1" res="$2"
+  wb_update '
+    if (.sessions | to_entries
+        | map(select(.key != $s and ((.value.holds // {}) | has($r))))
+        | length) == 0
+    then .sessions[$s] = ((.sessions[$s] // {})
+         + {holds: ((.sessions[$s].holds // {})
+                    | if has($r) then . else . + {($r): ($n|tonumber)} end)})
+    else . end' \
+    --arg s "$sid" --arg r "$res" --arg n "$(wb_now)" 2>/dev/null || true
+  [ "$(wb_read_fresh | jq -r --arg s "$sid" --arg r "$res" \
+        '((.sessions[$s].holds // {}) | has($r))' 2>/dev/null)" = "true" ]
 }

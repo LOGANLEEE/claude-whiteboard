@@ -107,9 +107,13 @@ elif [ -n "$label" ]; then
     --arg sid "$sid" --arg label "$label" 2>/dev/null || true
 fi
 
-# No ticket evidence and no label this prompt -> silent.
+# No ticket evidence and no label this prompt -> nothing to CONFLICT-CHECK.
+# This used to exit outright. It cannot any more: a session with no ticket and
+# no label still needs the resource notices below, which are about what it
+# HOLDS, not about what this prompt mentions.
+check_conflicts=1
 if [ -z "$wt_ticket" ] && [ -z "$prompt_ticket" ] && [ -z "$label" ]; then
-  exit 0
+  check_conflicts=0
 fi
 
 # --- Conflict checks (ticket + label, independent) ------------------------
@@ -185,7 +189,7 @@ WB_HOLDER='
   (.[0].key | clean), (.[0].value.dir | clean),
   (.[0].value.branch | clean), (.[0].value.ticket_src | clean)'
 
-if [ -n "$ticket" ]; then
+if [ "$check_conflicts" = 1 ] && [ -n "$ticket" ]; then
   # A worktree-backed holder is doing the work -> hard conflict. A holder that
   # only ever mentioned the ticket (or a pre-0.2.2 entry with no ticket_src)
   # gets a one-line note instead. Strong holders sort first.
@@ -208,7 +212,7 @@ if [ -n "$ticket" ]; then
   fi
 fi
 
-if [ -n "$label" ]; then
+if [ "$check_conflicts" = 1 ] && [ -n "$label" ]; then
   # Case-insensitive exact match on the trimmed label. A label is always an
   # explicit claim, so any holder is a hard conflict.
   holder="$(jq -r --arg self "$sid" --arg l "$label" '
@@ -225,6 +229,51 @@ if [ -n "$label" ]; then
     fi
   fi
 fi
+
+# --- Resource notices ------------------------------------------------------
+# Pull backup for the SendMessage handoff: a holder that never reads its inbox
+# still learns at its own next prompt that someone is blocked on it, and a
+# waiter learns its resource came free without asking again. Both reuse the
+# existing `warned` dedup, so a real situation is stated once instead of
+# becoming an every-prompt drumbeat.
+lp="$(wb_live_pids)"
+peers="$(wb_peer_names)"
+
+# 1. Resources I hold that other live sessions are waiting on.
+while IFS= read -r res; do
+  [ -n "$res" ] || continue
+  live_waiters=""
+  while IFS= read -r wline; do
+    [ -n "$wline" ] || continue
+    w_sid="$(cut -f1 <<< "$wline")"; w_since="$(cut -f2 <<< "$wline")"
+    wb_session_alive "$w_sid" "$lp" || continue
+    w_name="$(jq -r --arg s "$w_sid" '.[$s].name // ""' <<< "$peers" 2>/dev/null)"
+    live_waiters="${live_waiters:+$live_waiters, }${w_name:-${w_sid:0:8}} ($(( ( $(wb_now) - w_since ) / 60 ))m)"
+  done <<< "$(jq -r --arg r "$res" --arg self "$sid" '
+      .sessions | to_entries
+      | map(select(.key != $self and ((.value.waits // {}) | has($r))))
+      | .[] | [.key, (.value.waits[$r].since|tostring)] | @tsv' \
+    <<< "$fresh" 2>/dev/null)"
+  [ -n "$live_waiters" ] || continue
+  first_time "H:$res:$live_waiters" || continue
+  echo "[claude-whiteboard] sessions are waiting on \"$res\", which you hold: $live_waiters."
+  echo "Release it with /claude-whiteboard:free ${res%%@*} when your run is done."
+done <<< "$(jq -r --arg s "$sid" '.sessions[$s].holds // {} | keys[]' <<< "$fresh" 2>/dev/null)"
+
+# 2. Resources I am waiting for that no live session holds any more.
+while IFS= read -r res; do
+  [ -n "$res" ] || continue
+  [ -z "$(wb_holder_of "$res" "$sid" "${res%%@*}")" ] || continue
+  first_time "F:$res" || continue
+  until_ts="$(jq -r --arg r "$res" --arg s "$sid" \
+    '.sessions[$s].waits[$r].until // 0' <<< "$fresh" 2>/dev/null)"
+  left=$(( ${until_ts:-0} - $(wb_now) ))
+  if [ "$left" -gt 0 ]; then
+    echo "[claude-whiteboard] \"$res\" is now FREE — you were waiting. Reserved for you for $(( left / 60 + 1 ))m more."
+  else
+    echo "[claude-whiteboard] \"$res\" is now FREE — you were waiting."
+  fi
+done <<< "$(jq -r --arg s "$sid" '.sessions[$s].waits // {} | keys[]' <<< "$fresh" 2>/dev/null)"
 
 if [ "$warned_now" != "$warned_before" ]; then
   wb_update '.sessions[$sid].warned = $w' \

@@ -293,7 +293,7 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Changelog
 
-### Unreleased
+### 0.4.4
 
 - **Fix: `/use` handed one resource to two sessions and told both they had it.**
   `board.sh use` called `wb_hold`, which records a hold whoever else already has

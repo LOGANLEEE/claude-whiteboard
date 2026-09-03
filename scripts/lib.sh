@@ -128,6 +128,19 @@ wb_peer_names() {
 # Short session id for display.
 wb_short() { printf '%s' "${1:0:8}"; }
 
+# SendMessage address of one session, or "" when Claude Code has not named it.
+# Callers look it up lazily: only a refusal or a block ever needs an address.
+wb_peer_name() {
+  wb_peer_names | jq -r --arg s "$1" '.[$s].name // ""' 2>/dev/null || true
+}
+
+# wb_ago <epoch> -> "42s" / "12m". Used in messages that tell a session how long
+# someone else has been sitting on a resource.
+wb_ago() {
+  local d=$(( $(wb_now) - ${1:-0} ))
+  if [ "$d" -lt 60 ]; then printf '%ds' "$d"; else printf '%dm' $(( d / 60 )); fi
+}
+
 # Derive a ticket id from worktree dir / branch names passed as args, using the
 # same id shape as prompt sniffing so every tracker works, not just one project:
 #   "ethenapayf-1003-history-window" -> ETHENAPAYF-1003

@@ -23,6 +23,41 @@ source "$DIR/lib.sh"
 
 die() { echo "[claude-whiteboard] $*" >&2; exit 2; }
 
+# Clear crashed holders' rows and say so. Both `use` and `free` need it: a
+# phantom row blocks an exclusive claim and would otherwise be reported to the
+# user as somebody else's live hold. No-op when liveness is unknown.
+report_sweep() {
+  local swept; swept="$(wb_sweep_dead_holds "$1")"
+  [ -n "$swept" ] || return 0
+  echo "[claude-whiteboard] cleared \"$1\" from crashed session(s): $(printf '%s' "$swept" | tr '\n' ' ' | sed 's/ *$//')."
+}
+
+# Refusal body naming whoever else holds <res>. Prints nothing and returns 1 when
+# no other session holds it. Shared by `use` and `free` so the two cannot drift
+# into telling a blocked session different things about the same board.
+#   refusal_for <res> <bare> <self>
+refusal_for() {
+  local res="$1" bare="$2" self="$3" other o_sid o_since o_name
+  other="$(jq -r --arg s "$self" --arg r "$res" '
+      .sessions | to_entries
+      | map(select(.key != $s and ((.value.holds // {})[$r] // 0) > 0))
+      | sort_by(.value.holds[$r]) | .[0] | select(. != null)
+      | .key, (.value.holds[$r] | tostring)' <<< "$(wb_read_fresh)" 2>/dev/null)"
+  [ -n "$other" ] || return 1
+  # One field per line, as wb_holder_of does: "|" is legal in the strings a
+  # session row carries and TAB is IFS whitespace.
+  o_sid=""; o_since=""
+  { IFS= read -r o_sid; IFS= read -r o_since; } <<< "$other" || true
+  printf '"%s" is held by session %s since %s ago. Nothing was changed.\n' \
+    "$res" "${o_sid:0:8}" "$(wb_ago "$o_since")"
+  o_name="$(wb_peer_name "$o_sid")"
+  if [ -n "$o_name" ]; then
+    printf 'Ask that session:\n  SendMessage({to: "%s", message: "Are you still using %s? I need it."})\n' \
+      "$o_name" "$bare"
+  fi
+  printf 'If you have verified that session is dead: /claude-whiteboard:force %s\n' "$bare"
+}
+
 wb_have_jq || die "'jq' is not installed, so nothing was recorded on the board."
 
 action="${1:-}"
@@ -50,8 +85,20 @@ wb_touch "$sid"
 case "$action" in
   use)
     res="$(wb_resource_name "$arg" "$PWD")"
-    wb_hold "$sid" "$res"
-    echo "[claude-whiteboard] you now hold \"$res\"."
+    report_sweep "$res"
+    # wb_hold, which this used to call, records a hold whoever else has one, and
+    # the echo below was unconditional — so /use handed the same resource to two
+    # sessions at once and told both they had it. That is exactly the collision
+    # the PreToolUse hook refuses to allow, arrived at through the front door.
+    # wb_hold_exclusive does the check and the write in ONE jq under ONE lock,
+    # then re-reads, and returns false unless this session really holds it.
+    if wb_hold_exclusive "$sid" "$res"; then
+      echo "[claude-whiteboard] you now hold \"$res\"."
+    else
+      refusal="$(refusal_for "$res" "$arg" "$sid")" \
+        || refusal="\"$res\" was not claimed, and no other holder is recorded — the registry write failed. Registry: $WB_REGISTRY"
+      die "refused: $refusal"
+    fi
     ;;
   free)
     res="$(wb_resource_name "$arg" "$PWD")"
@@ -66,38 +113,17 @@ case "$action" in
       # the refusal below would name a session that no longer exists, and the
       # row would survive every /free forever. No-op when liveness is unknown,
       # so a machine with no session registry never loses a live hold.
-      swept="$(wb_sweep_dead_holds "$res")"
-      if [ -n "$swept" ]; then
-        echo "[claude-whiteboard] cleared \"$res\" from crashed session(s): $(printf '%s' "$swept" | tr '\n' ' ' | sed 's/ *$//')."
-      fi
-      fresh="$(wb_read_fresh)"
+      report_sweep "$res"
       # wb_unhold deletes from the CALLER's holds, so a non-holder deletes
       # nothing — and the old unconditional "released" reported that no-op as
       # success. A session then sat blocked behind a hold it believed it had
       # just cleared, twice, for 165 minutes. Refuse instead, and name the
       # holder, the peer to ask, and the escape hatch.
-      other="$(jq -r --arg s "$sid" --arg r "$res" '
-          .sessions | to_entries
-          | map(select(.key != $s and ((.value.holds // {})[$r] // 0) > 0))
-          | sort_by(.value.holds[$r]) | .[0] | select(. != null)
-          | .key, (.value.holds[$r] | tostring)' <<< "$fresh" 2>/dev/null)"
-      if [ -z "$other" ]; then
+      if ! refusal="$(refusal_for "$res" "$arg" "$sid")"; then
         echo "[claude-whiteboard] \"$res\" is not held by this session, and nobody else holds it — nothing to release."
         exit 0
       fi
-      # One field per line, as wb_holder_of does: "|" is legal in the strings
-      # a session row carries and TAB is IFS whitespace.
-      o_sid=""; o_since=""
-      { IFS= read -r o_sid; IFS= read -r o_since; } <<< "$other" || true
-      o_name="$(wb_peer_name "$o_sid")"
-      ask=""
-      if [ -n "$o_name" ]; then
-        ask="
-Ask that session:
-  SendMessage({to: \"$o_name\", message: \"Are you still using $arg? I need it.\"})"
-      fi
-      die "refused: \"$res\" is held by session ${o_sid:0:8} since $(wb_ago "$o_since") ago, not by this session. Nothing was changed.$ask
-If you have verified that session is dead: /claude-whiteboard:force $arg"
+      die "refused: $refusal"
     fi
 
     wb_unhold "$sid" "$res"

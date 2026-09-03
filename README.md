@@ -264,7 +264,7 @@ claude --plugin-dir ./claude-whiteboard
 - `/claude-whiteboard:status` — print the current board (active sessions, tickets, labels, branches, peer names, last-seen age).
 - `/claude-whiteboard:claim <label>` — claim a free-text label for ticketless work so other sessions are warned off it.
 - `/claude-whiteboard:release` — drop this session's claimed label.
-- `/claude-whiteboard:use <resource>` — manually claim a shared resource. Needed only for something no command can be matched against, notably a GUI Xcode build.
+- `/claude-whiteboard:use <resource>` — manually claim a shared resource. Needed only for something no command can be matched against, notably a GUI Xcode build. Refuses, and names the holder, when another session holds it.
 - `/claude-whiteboard:free <resource>` — release a resource **this session holds** and give waiters a head start. Refuses, and names the holder, when someone else holds it.
 - `/claude-whiteboard:force <resource>` — take it from a holder you have verified is not using it.
 
@@ -292,6 +292,20 @@ claude --plugin-dir ./claude-whiteboard
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 
 ## Changelog
+
+### Unreleased
+
+- **Fix: `/use` handed one resource to two sessions and told both they had it.**
+  `board.sh use` called `wb_hold`, which records a hold whoever else already has
+  one, and printed `you now hold "<res>"` unconditionally — so the front door
+  granted exactly the collision the `PreToolUse` hook refuses to allow. It now
+  claims through `wb_hold_exclusive` (check and write in one `jq` under one lock,
+  then a re-read) and refuses when another session holds the resource, naming the
+  holder, the peer to message and `/force`. Crashed holders are swept first, so a
+  phantom row cannot block a claim forever. Re-claiming a resource this session
+  already holds stays idempotent and does not refresh `since`.
+- The refusal message is now one helper shared by `use` and `free`, so the two
+  commands cannot drift into telling a blocked session different things.
 
 ### 0.4.3
 

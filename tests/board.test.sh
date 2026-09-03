@@ -83,6 +83,46 @@ run S1 "$REPO" free xcode >/dev/null
 eq "free opens the waiter's priority window" "true" \
    "$(q '.sessions.S2.waits["xcode@mainrepo"].until > 0')"
 
+# --- use refuses when someone else holds it --------------------------------
+# The bug this pins: `use` called wb_hold, which records a hold whoever else has
+# one, and printed "you now hold" unconditionally. Two sessions could hold the
+# same resource through /use and both be told they had it — the exact collision
+# the PreToolUse hook refuses to allow, reached through the front door.
+reset
+run S2 "$REPO" use xcode >/dev/null
+SINCE_BEFORE="$(q '.sessions.S2.holds["xcode@mainrepo"]')"
+out="$(run S1 "$REPO" use xcode)"; err="$(cat "$WORK/err")"
+eq  "use against a live holder fails"          "2"     "$(rc)"
+eq  "use against a live holder takes nothing"  "false" \
+    "$(q '(.sessions.S1.holds // {}) | has("xcode@mainrepo")')"
+eq  "use against a live holder leaves the holder alone" "$SINCE_BEFORE" \
+    "$(q '.sessions.S2.holds["xcode@mainrepo"]')"
+eq  "use against a live holder prints no success" "" "$out"
+has "use refusal names the holder"        "S2"           "$err"
+has "use refusal gives the peer name"     'to: "bravo"'  "$err"
+has "use refusal gives the escape hatch"  "force xcode"  "$err"
+
+# Re-using what this session already holds stays idempotent — `since` must not be
+# refreshed, or an idle holder could keep a resource forever by repeating itself.
+reset
+run S1 "$REPO" use xcode >/dev/null
+SINCE_BEFORE="$(q '.sessions.S1.holds["xcode@mainrepo"]')"
+out="$(run S1 "$REPO" use xcode)"
+eq  "re-using your own hold succeeds" "0" "$(rc)"
+eq  "re-using your own hold does not refresh since" "$SINCE_BEFORE" \
+    "$(q '.sessions.S1.holds["xcode@mainrepo"]')"
+has "re-using your own hold says so" "you now hold" "$out"
+
+# A crashed holder must not block a claim: wb_hold_exclusive refuses on ANY other
+# session's row, phantom included, so the sweep has to run first.
+reset
+run S3 "$REPO" use xcode >/dev/null
+out="$(run S1 "$REPO" use xcode)"
+eq  "use clears a crashed holder"       "0"    "$(rc)"
+eq  "use then takes the resource"       "true" "$(q '.sessions.S1.holds | has("xcode@mainrepo")')"
+eq  "the crashed holder's row is gone"  "0"    "$(q '.sessions.S3.holds | length')"
+has "the sweep is reported by use"      "crashed session" "$out"
+
 # --- free refuses when someone else holds it -------------------------------
 # The bug this pins: wb_unhold deletes from the CALLER's holds, so a non-holder
 # deleted nothing while `free` printed "released" unconditionally. A session sat

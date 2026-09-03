@@ -293,7 +293,7 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Changelog
 
-### Unreleased
+### 0.4.3
 
 - **Fix: `/free` reported success without releasing anything.** `wb_unhold`
   deletes from the *caller's* holds, so a session freeing a resource it did not

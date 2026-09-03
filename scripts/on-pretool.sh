@@ -78,17 +78,6 @@ done <<< "$releases"
 
 [ -n "$claims" ] || exit 0
 
-# Address of a session, for the "go ask them" line. Looked up lazily: an
-# ordinary command never reaches here, so the join costs nothing in steady state.
-peer_name() {
-  wb_peer_names | jq -r --arg s "$1" '.[$s].name // ""' 2>/dev/null || true
-}
-
-ago() {  # ago <epoch> -> "12m"
-  local d=$(( $(wb_now) - ${1:-0} ))
-  if [ "$d" -lt 60 ]; then printf '%ds' "$d"; else printf '%dm' $(( d / 60 )); fi
-}
-
 # Pass 1: decide. A compound command must be all-or-nothing — a partial claim
 # would leave a phantom on a resource that was not even the reason for the block.
 blocked=""
@@ -130,9 +119,9 @@ while IFS= read -r bare; do
     { IFS= read -r h_sid; IFS= read -r h_dir; IFS= read -r h_br
       IFS= read -r h_since; IFS= read -r h_state; } <<< "$holder" || true
     if [ "$h_state" = "hard" ]; then
-      name="$(peer_name "$h_sid")"
+      name="$(wb_peer_name "$h_sid")"
       blocked="${blocked}BLOCKED: \"$res\" is held by session ${h_sid:0:8}
-  dir: ${h_dir:-?}   branch: ${h_br:-?}   since: $(ago "$h_since") ago
+  dir: ${h_dir:-?}   branch: ${h_br:-?}   since: $(wb_ago "$h_since") ago
 
 Do NOT start your own — a second instance rewrites the shared state the holder
 is running against, and the failure will surface as a bug in THEIR work.
@@ -155,7 +144,7 @@ You are now recorded as WAITING for it.
     fi
     # soft: the holder is alive but idle and unprobed. Take it, say so.
     wb_unhold "$h_sid" "$res"
-    notes="${notes}[claude-whiteboard] took \"$res\" from session ${h_sid:0:8} — idle $(ago "$h_since"), no probe to prove it is still up.
+    notes="${notes}[claude-whiteboard] took \"$res\" from session ${h_sid:0:8} — idle $(wb_ago "$h_since"), no probe to prove it is still up.
 "
   fi
 
@@ -174,7 +163,7 @@ You are now recorded as WAITING for it.
   if [ -n "$reserved" ]; then
     w_sid=""; w_for=""; w_until=""
     { IFS= read -r w_sid; IFS= read -r w_for; IFS= read -r w_until; } <<< "$reserved" || true
-    name="$(peer_name "$w_sid")"
+    name="$(wb_peer_name "$w_sid")"
     blocked="${blocked}BLOCKED: \"$res\" is free but reserved for $(( (w_until - $(wb_now)) / 60 + 1 ))m more.
 Session ${w_sid:0:8}${name:+ ($name)} has been waiting $(( w_for / 60 ))m. Ask before you take it:
 "

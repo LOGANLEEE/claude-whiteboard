@@ -265,7 +265,7 @@ claude --plugin-dir ./claude-whiteboard
 - `/claude-whiteboard:claim <label>` — claim a free-text label for ticketless work so other sessions are warned off it.
 - `/claude-whiteboard:release` — drop this session's claimed label.
 - `/claude-whiteboard:use <resource>` — manually claim a shared resource. Needed only for something no command can be matched against, notably a GUI Xcode build.
-- `/claude-whiteboard:free <resource>` — release it and give waiters a head start.
+- `/claude-whiteboard:free <resource>` — release a resource **this session holds** and give waiters a head start. Refuses, and names the holder, when someone else holds it.
 - `/claude-whiteboard:force <resource>` — take it from a holder you have verified is not using it.
 
 ## Notes & limits
@@ -292,6 +292,19 @@ claude --plugin-dir ./claude-whiteboard
   `flock` dependency — works on macOS and Linux), so 2–6 sessions won't corrupt the file.
 
 ## Changelog
+
+### Unreleased
+
+- **Fix: `/free` reported success without releasing anything.** `wb_unhold`
+  deletes from the *caller's* holds, so a session freeing a resource it did not
+  hold deleted nothing — while `board.sh free` printed `released "<res>"`
+  unconditionally, because nothing checked whether the registry had changed. A
+  session ran `/claude-whiteboard:free xcode` twice, was told it worked twice,
+  and stayed blocked behind the same hold for 165 minutes. `free` now settles
+  its own hold first, then refuses when another session holds the resource,
+  naming the holder, the peer to message and `/force`; re-reads the registry
+  before claiming a release; and opens the waiters' priority window only after
+  a release that actually happened.
 
 ### 0.4.2
 

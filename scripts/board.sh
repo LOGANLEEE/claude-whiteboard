@@ -55,7 +55,61 @@ case "$action" in
     ;;
   free)
     res="$(wb_resource_name "$arg" "$PWD")"
+
+    # Own hold is settled FIRST, before any liveness reasoning. A session whose
+    # own row Claude Code never wrote reads "dead" to wb_session_alive, and
+    # sweeping ahead of this check would delete the caller's own hold and then
+    # report it had nothing to release.
+    if [ "$(wb_read_fresh | jq -r --arg s "$sid" --arg r "$res" \
+              '((.sessions[$s].holds // {}) | has($r))' 2>/dev/null)" != "true" ]; then
+      # A crashed holder's row must not out-argue the user: without this sweep
+      # the refusal below would name a session that no longer exists, and the
+      # row would survive every /free forever. No-op when liveness is unknown,
+      # so a machine with no session registry never loses a live hold.
+      swept="$(wb_sweep_dead_holds "$res")"
+      if [ -n "$swept" ]; then
+        echo "[claude-whiteboard] cleared \"$res\" from crashed session(s): $(printf '%s' "$swept" | tr '\n' ' ' | sed 's/ *$//')."
+      fi
+      fresh="$(wb_read_fresh)"
+      # wb_unhold deletes from the CALLER's holds, so a non-holder deletes
+      # nothing — and the old unconditional "released" reported that no-op as
+      # success. A session then sat blocked behind a hold it believed it had
+      # just cleared, twice, for 165 minutes. Refuse instead, and name the
+      # holder, the peer to ask, and the escape hatch.
+      other="$(jq -r --arg s "$sid" --arg r "$res" '
+          .sessions | to_entries
+          | map(select(.key != $s and ((.value.holds // {})[$r] // 0) > 0))
+          | sort_by(.value.holds[$r]) | .[0] | select(. != null)
+          | .key, (.value.holds[$r] | tostring)' <<< "$fresh" 2>/dev/null)"
+      if [ -z "$other" ]; then
+        echo "[claude-whiteboard] \"$res\" is not held by this session, and nobody else holds it — nothing to release."
+        exit 0
+      fi
+      # One field per line, as wb_holder_of does: "|" is legal in the strings
+      # a session row carries and TAB is IFS whitespace.
+      o_sid=""; o_since=""
+      { IFS= read -r o_sid; IFS= read -r o_since; } <<< "$other" || true
+      o_name="$(wb_peer_name "$o_sid")"
+      ask=""
+      if [ -n "$o_name" ]; then
+        ask="
+Ask that session:
+  SendMessage({to: \"$o_name\", message: \"Are you still using $arg? I need it.\"})"
+      fi
+      die "refused: \"$res\" is held by session ${o_sid:0:8} since $(wb_ago "$o_since") ago, not by this session. Nothing was changed.$ask
+If you have verified that session is dead: /claude-whiteboard:force $arg"
+    fi
+
     wb_unhold "$sid" "$res"
+    # wb_update reports nothing about whether its filter fired and swallows a jq
+    # failure, so the write's success is not the resulting state. Re-read before
+    # claiming anything — that claim is what the caller acts on.
+    if [ "$(wb_read_fresh | jq -r --arg s "$sid" --arg r "$res" \
+              '((.sessions[$s].holds // {}) | has($r))' 2>/dev/null)" = "true" ]; then
+      die "\"$res\" is STILL recorded as held by this session — the registry write failed. Registry: $WB_REGISTRY"
+    fi
+    # Only after a real release: a window opened on a resource somebody else
+    # still holds burns the waiters' head start while they cannot take it.
     wb_open_window "$res" "$WB_RESERVE"
     echo "[claude-whiteboard] released \"$res\"."
     ;;

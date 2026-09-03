@@ -20,6 +20,22 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export CC_WHITEBOARD_REGISTRY="$WORK/registry.json"
 
+# Liveness fixtures. Without CC_WHITEBOARD_SESSIONS_DIR the library reads the
+# REAL ~/.claude/sessions, where S1/S2 do not exist, so every holder here would
+# read "crashed" and the refusal path could never be exercised.
+SESSDIR="$WORK/sessions"; mkdir -p "$SESSDIR"
+export CC_WHITEBOARD_SESSIONS_DIR="$SESSDIR"
+MYSTART="$(TZ=UTC ps -o lstart= -p $$ 2>/dev/null | sed 's/^ *//; s/ *$//')"
+sessfile() {  # sessfile <sid> <pid> <procStart> [name]
+  jq -n --arg s "$1" --argjson p "$2" --arg ps "$3" --arg n "${4:-}" \
+    '{sessionId:$s, pid:$p, procStart:$ps, kind:"interactive",
+      status:"idle", updatedAt:1}
+     + (if $n != "" then {name:$n} else {} end)' > "$SESSDIR/$1.json"
+}
+sessfile S1 $$     "$MYSTART"                 alpha
+sessfile S2 $$     "$MYSTART"                 bravo
+sessfile S3 999999 "Mon Jan  1 00:00:00 2020" charlie   # crashed
+
 REPO="$WORK/mainrepo"
 mkdir -p "$REPO"
 git init -q -b main "$REPO"
@@ -51,8 +67,10 @@ eq "use records a repo-scoped hold" "true" \
    "$(q '.sessions.S1.holds | has("xcode@mainrepo")')"
 has "use says what it claimed" "xcode@mainrepo" "$out"
 
-run S1 "$REPO" free xcode >/dev/null
+out="$(run S1 "$REPO" free xcode)"
 eq "free drops the hold" "0" "$(q '.sessions.S1.holds | length')"
+eq "free by the real holder succeeds"  "0"          "$(rc)"
+has "free by the real holder says so"  "released"   "$out"
 
 # --- free opens the priority window for waiters ----------------------------
 reset
@@ -64,6 +82,48 @@ jq --arg n "$NOW" '.sessions.S2 = {updated:($n|tonumber), started:($n|tonumber),
 run S1 "$REPO" free xcode >/dev/null
 eq "free opens the waiter's priority window" "true" \
    "$(q '.sessions.S2.waits["xcode@mainrepo"].until > 0')"
+
+# --- free refuses when someone else holds it -------------------------------
+# The bug this pins: wb_unhold deletes from the CALLER's holds, so a non-holder
+# deleted nothing while `free` printed "released" unconditionally. A session sat
+# blocked for 165 minutes behind a hold it believed it had cleared, twice.
+reset
+run S2 "$REPO" use xcode >/dev/null
+SINCE_BEFORE="$(q '.sessions.S2.holds["xcode@mainrepo"]')"
+out="$(run S1 "$REPO" free xcode)"; err="$(cat "$WORK/err")"
+eq  "free by a non-holder fails"            "2" "$(rc)"
+eq  "free by a non-holder leaves the hold"  "$SINCE_BEFORE" \
+    "$(q '.sessions.S2.holds["xcode@mainrepo"]')"
+eq  "free by a non-holder prints no success" "" "$out"
+has "refusal names the holder"    "S2"       "$err"
+has "refusal says nothing changed" "Nothing was changed" "$err"
+has "refusal gives the peer name" 'to: "bravo"' "$err"
+has "refusal gives the escape hatch" "force xcode" "$err"
+
+# A refusal must not spend the waiters' head start on a resource still held.
+reset
+run S2 "$REPO" use xcode >/dev/null
+NOW="$(date +%s)"
+jq --arg n "$NOW" '.sessions.S1 = {updated:($n|tonumber), started:($n|tonumber),
+     waits:{"xcode@mainrepo":{since:($n|tonumber), until:0}}}' \
+  "$CC_WHITEBOARD_REGISTRY" > "$WORK/tmp" && mv "$WORK/tmp" "$CC_WHITEBOARD_REGISTRY"
+run S1 "$REPO" free xcode >/dev/null
+eq "a refused free leaves the priority window shut" "0" \
+   "$(q '.sessions.S1.waits["xcode@mainrepo"].until')"
+
+# --- free when nobody holds it ---------------------------------------------
+reset
+out="$(run S1 "$REPO" free xcode)"
+eq  "free on a free resource succeeds"  "0"                   "$(rc)"
+has "free on a free resource says so"   "nothing to release"  "$out"
+
+# A crashed holder's row is cleared, not reported as somebody else's hold.
+reset
+run S3 "$REPO" use xcode >/dev/null
+out="$(run S1 "$REPO" free xcode)"
+eq  "a crashed holder's row is cleared" "0" "$(q '.sessions.S3.holds | length')"
+has "the sweep is reported"             "crashed session"    "$out"
+has "and then there is nothing to free" "nothing to release" "$out"
 
 # --- force -----------------------------------------------------------------
 reset

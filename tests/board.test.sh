@@ -211,6 +211,26 @@ PLAIN="$WORK/not-a-repo"; mkdir -p "$PLAIN"
 run S1 "$PLAIN" use xcode >/dev/null
 eq "outside a repo the name is bare" "true" "$(q '.sessions.S1.holds | has("xcode")')"
 
+# --- the name the board prints is accepted as-is ---------------------------
+# /use and status.sh print "xcode@mainrepo". A session that copies that name
+# back into use/free/force used to get "xcode@mainrepo@mainrepo", a key nobody
+# holds: free said "nothing to release" while the real hold stayed.
+reset
+out="$(run S1 "$REPO" use xcode@mainrepo)"
+eq "use with the printed name records the real key" "xcode@mainrepo" \
+   "$(q '.sessions.S1.holds | keys | join(",")')"
+
+out="$(run S1 "$REPO" free xcode@mainrepo)"
+eq "free with the printed name drops the hold" "0" "$(q '.sessions.S1.holds | length')"
+has "free with the printed name says released" "released \"xcode@mainrepo\"" "$out"
+
+reset
+run S1 "$REPO" use xcode >/dev/null
+out="$(run S2 "$REPO" force xcode@mainrepo)"
+eq "force with the printed name takes the hold" "xcode@mainrepo" \
+   "$(q '.sessions.S2.holds | keys | join(",")')"
+eq "force with the printed name strips the holder" "0" "$(q '.sessions.S1.holds | length')"
+
 # --- status.sh must not pass off the wrong file as an empty board ----------
 # status.sh is what /free tells the model to run to verify the release worked.
 # When it resolved a registry that does not exist it printed "No active

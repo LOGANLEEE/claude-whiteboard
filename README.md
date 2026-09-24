@@ -293,6 +293,15 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Changelog
 
+### Unreleased
+
+- **Fix: `/free` with the name the board prints never matched the hold.**
+  `wb_resource_name` always appended `@<repo>`, so passing the qualified name
+  that `/use` and `status.sh` print (`local-stack@my-repo`) to `use`, `free` or
+  `force` targeted `local-stack@my-repo@my-repo`, which nobody holds. `free`
+  then answered "nothing to release" while the real hold stayed. A name that
+  already ends in `@<repo>` is now used as-is.
+
 ### 0.4.4
 
 - **Fix: `/use` handed one resource to two sessions and told both they had it.**

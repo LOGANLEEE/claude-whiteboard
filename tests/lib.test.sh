@@ -36,6 +36,10 @@ eq "resource name is repo-scoped" "local-stack@mainrepo" \
    "$(wb_resource_name local-stack "$MAIN")"
 eq "resource name bare outside a repo" "local-stack" \
    "$(wb_resource_name local-stack "$WORK")"
+eq "an already-qualified name is not suffixed again" "local-stack@mainrepo" \
+   "$(wb_resource_name local-stack@mainrepo "$MAIN")"
+eq "a bare @repo is still suffixed" "@mainrepo@mainrepo" \
+   "$(wb_resource_name @mainrepo "$MAIN")"
 
 # --- PID liveness ----------------------------------------------------------
 SESSDIR="$WORK/sessions"; mkdir -p "$SESSDIR"

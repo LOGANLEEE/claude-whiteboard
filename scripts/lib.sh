@@ -185,10 +185,17 @@ wb_repo_key() {
 # "<bare>@<repo>", or bare when the directory is not a git repo. The registry is
 # shared by every repo on the machine, so an unscoped name would let one
 # project's local-stack block an unrelated project's.
+# A name that already ends in "@<repo>" is returned as-is: /use and status.sh
+# print the qualified name, and a session that copies it back must hit the same
+# key, not "<bare>@<repo>@<repo>", which nobody holds.
 wb_resource_name() {
   local repo
   repo="$(wb_repo_key "${2:-$PWD}" 2>/dev/null || true)"
-  if [ -n "$repo" ]; then printf '%s@%s' "$1" "$repo"; else printf '%s' "$1"; fi
+  [ -n "$repo" ] || { printf '%s' "$1"; return; }
+  case "$1" in
+    ?*"@$repo") printf '%s' "$1" ;;
+    *)          printf '%s@%s' "$1" "$repo" ;;
+  esac
 }
 
 # {sessionId: {pid, procStart, updatedAt}} from Claude Code's own session

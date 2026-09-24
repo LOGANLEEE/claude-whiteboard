@@ -293,7 +293,7 @@ claude --plugin-dir ./claude-whiteboard
 
 ## Changelog
 
-### Unreleased
+### 0.4.5
 
 - **Fix: `/free` with the name the board prints never matched the hold.**
   `wb_resource_name` always appended `@<repo>`, so passing the qualified name
